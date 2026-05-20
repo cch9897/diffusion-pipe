@@ -547,6 +547,18 @@ llm_path = '/data2/imagegen_models/comfyui-models/qwen_3_06b_base.safetensors'
 dtype = 'bfloat16'
 # Comment out to train the llm_adapter, or adjust the learning rate to be >0.
 llm_adapter_lr = 0
+# Opt-in: wraps each transformer block with torch.compile. First step takes minutes
+# to warm up; subsequent steps are typically 10-25% faster. Same flag works for
+# Cosmos-Predict2 since they share the DiT implementation.
+#torch_compile = true
+# Set to true if training on multiple size buckets (multi-resolution), otherwise each
+# new shape triggers one recompile per block. Slightly less optimized graph, but no
+# recompile churn. Default: false.
+#torch_compile_dynamic = true
+# torch.compile mode. 'default' is safest. 'reduce-overhead' enables CUDA graphs and
+# can be faster but is more sensitive to block_swap / activation_checkpointing.
+# 'max-autotune' takes much longer to compile. Default: 'default'.
+#torch_compile_mode = 'default'
 ```
 
 Use the official [ComfyUI format model files](https://huggingface.co/circlestone-labs/Anima).
@@ -556,6 +568,11 @@ Notes:
 - You can control the llm_adapter learning rate separately. This is an adapter that processes the Qwen3 embeddings before feeding into the diffusion model.
   - Setting `llm_adapter_lr=0` disables training it entirely. This probably makes training more stable for small datasets.
   - If you have a larger dataset or a lot of brand-new concepts, you can try training the llm_adapter and see if it helps.
+- `torch_compile = true` enables per-block `torch.compile`. Known incompatibilities:
+  - `activation_checkpointing = 'unsloth'` wraps the block forward in `@torch._disable_dynamo`, so compile becomes a no-op.
+  - `blocks_to_swap > 0` mutates `module.weight.data` on every step, which can invalidate dynamo guards and trigger recompiles.
+  - `transformer_dtype = 'float8'` has limited dynamo coverage and may cause graph breaks.
+  - Many size buckets will cause one recompile per new (block, shape) pair under default settings; either set `torch_compile_dynamic = true` (slightly less optimized graph, but no churn) or leave compile off.
 - **Assume that any lora trained on the preview version won't work well on the final version**
   - Consider it to be a "throwaway lora" that you likely will need to retrain.
   - The underlying model is still training and it will diverge from the preview weights.

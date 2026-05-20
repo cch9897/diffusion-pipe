@@ -409,6 +409,33 @@ class CosmosPredict2Pipeline(BasePipeline):
     def to_layers(self):
         transformer = self.transformer
         text_encoder = None if self.cache_text_embeddings else self.text_encoder
+
+        # Opt-in per-block torch.compile. We compile the inner Block.forward (not the
+        # outer TransformerLayer.forward) so that ModelOffloader.wait_for_block /
+        # submit_move_blocks_forward stay outside the compiled graph. PEFT has already
+        # injected LoRA modules by this point (configure_adapter runs before to_layers),
+        # so they are part of the traced graph.
+        if self.model_config.get('torch_compile', False):
+            compile_mode = self.model_config.get('torch_compile_mode', 'default')
+            compile_dynamic = self.model_config.get('torch_compile_dynamic', False)
+            if is_main_process():
+                print(f'Compiling transformer blocks with torch.compile (mode={compile_mode!r}, dynamic={compile_dynamic}, fullgraph=False)...')
+                if self.config.get('activation_checkpointing') == 'unsloth':
+                    print('  warning: activation_checkpointing="unsloth" wraps the block in @torch._disable_dynamo; compile will be a no-op.')
+                if self.config.get('blocks_to_swap', 0):
+                    print('  warning: blocks_to_swap mutates module.weight.data on every step; this can invalidate dynamo guards and trigger recompiles.')
+                if self.model_config.get('transformer_dtype') == torch.float8_e4m3fn:
+                    print('  warning: transformer_dtype=float8 has limited dynamo support; expect graph breaks.')
+                if not compile_dynamic:
+                    print('  note: dynamic=False — every new (block, shape) pair will recompile. Set torch_compile_dynamic=true if training on multiple size buckets.')
+            for block in transformer.blocks:
+                block.forward = torch.compile(
+                    block.forward,
+                    mode=compile_mode,
+                    fullgraph=False,
+                    dynamic=compile_dynamic,
+                )
+
         layers = [
             InitialLayer(transformer, text_encoder, self.is_generic_llm),
             LLMAdapterLayer(transformer.llm_adapter if self.use_llm_adapter else None),
