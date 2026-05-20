@@ -18,6 +18,7 @@ from typing import Any, Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from torch import nn
@@ -64,17 +65,43 @@ def _apply_rotary_pos_emb_base(
         Input tensor of shape `[s, b, h, d]` or `[b, s, h, d]`, on which rotary positional
         embedding will be applied.
     freqs: torch.Tensor
-        Rotary positional embedding tensor of shape `[s2, 1, 1, d2]` and dtype 'float',
-        with `s2 >= s` and `d2 <= d`.
+        Either raw RoPE freqs of shape `[s2, 1, 1, d2]` (dtype float), with `s2 >= s` and
+        `d2 <= d`; or a precomputed stack `[2, s2, 1, 1, d2]` where index 0 is cos and
+        index 1 is sin (dtype float). When the precomputed form is passed the cos/sin
+        trig ops are skipped — this is what `VideoRopePosition3DEmb` now returns so the
+        trig isn't recomputed inside every self-attention call.
     start_positions: torch.Tensor, default = None.
         Tokens in a sequence `i` should be applied with position encoding offset by
         `start_positions[i]`. If `start_positions=None`, there's no offset.
+        Only supported for the raw-freqs input.
     tensor_format: {'sbhd', 'bshd'}, default = 'sbhd'
         Should be `bshd` if `t` is of shape `[bs, seq, ...]`, or `sbhd` if `t` is of shape
         `[seq, bs, ...]`.
     interleaved: bool, default = False
         Whether to use interleaved rotary position embedding.
     """
+    precomputed = (freqs.ndim == 5)
+
+    if precomputed:
+        assert start_positions is None, "start_positions not supported with precomputed cos/sin"
+        cos_full, sin_full = freqs[0], freqs[1]
+        max_seq_len = cos_full.shape[0]
+        cur_seq_len = t.shape[1] if tensor_format == "bshd" else t.shape[0]
+        assert (
+            cur_seq_len <= max_seq_len
+        ), f"Rotary Embeddings only supported up to {max_seq_len} sequence length!"
+        cos_ = cos_full[:cur_seq_len]
+        sin_ = sin_full[:cur_seq_len]
+        if tensor_format == "bshd":
+            cos_ = cos_.transpose(0, 1)
+            sin_ = sin_.transpose(0, 1)
+        cos_ = cos_.to(t.dtype)
+        sin_ = sin_.to(t.dtype)
+        rot_dim = cos_.shape[-1]
+        t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
+        t = (t * cos_) + (_rotate_half(t, interleaved) * sin_)
+        return torch.cat((t, t_pass), dim=-1)
+
     max_seq_len = freqs.shape[0]
     cur_seq_len = t.shape[1] if tensor_format == "bshd" else t.shape[0]
 
@@ -235,8 +262,12 @@ class RMSNorm(torch.nn.Module):
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    @torch.autocast('cuda', dtype=torch.float32)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Body explicitly upcasts to fp32 for the variance/rsqrt, so the previous
+        # @torch.autocast('cuda', dtype=torch.float32) decorator only forced the final
+        # `output * self.weight` mul into fp32 — not worth the autocast push/pop on every
+        # q/k norm (4 per block × 28 blocks). Drop the decorator and let the outer autocast
+        # dtype (bf16 in training) govern the final mul.
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
@@ -611,7 +642,11 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
             dim=-1,
         )
 
-        return rearrange(em_T_H_W_D, "t h w d -> (t h w) 1 1 d").float()
+        freqs = rearrange(em_T_H_W_D, "t h w d -> (t h w) 1 1 d").float()
+        # Precompute cos/sin once so the trig isn't recomputed inside every self-attention.
+        # Stack as [2, L, 1, 1, D] — index 0 is cos, index 1 is sin. The rotary apply path
+        # detects this rank-5 shape and skips the cos/sin computation.
+        return torch.stack((freqs.cos(), freqs.sin()), dim=0)
 
     @property
     def seq_dim(self) -> int:
@@ -1044,24 +1079,27 @@ class Block(nn.Module):
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
+        # adaln_modulation_* are nn.Sequential(SiLU, Linear[, Linear]). The SiLU at index 0
+        # is identical across all three branches and takes the same input, so apply it once
+        # here and call only the remaining Linear(s) for each branch.
+        silu_emb = F.silu(emb_B_T_D)
+        mod_self = self.adaln_modulation_self_attn
+        mod_cross = self.adaln_modulation_cross_attn
+        mod_mlp = self.adaln_modulation_mlp
         if self.use_adaln_lora:
             shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
-                self.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D
+                mod_self[2](mod_self[1](silu_emb)) + adaln_lora_B_T_3D
             ).chunk(3, dim=-1)
             shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = (
-                self.adaln_modulation_cross_attn(emb_B_T_D) + adaln_lora_B_T_3D
+                mod_cross[2](mod_cross[1](silu_emb)) + adaln_lora_B_T_3D
             ).chunk(3, dim=-1)
             shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = (
-                self.adaln_modulation_mlp(emb_B_T_D) + adaln_lora_B_T_3D
+                mod_mlp[2](mod_mlp[1](silu_emb)) + adaln_lora_B_T_3D
             ).chunk(3, dim=-1)
         else:
-            shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = self.adaln_modulation_self_attn(
-                emb_B_T_D
-            ).chunk(3, dim=-1)
-            shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = self.adaln_modulation_cross_attn(
-                emb_B_T_D
-            ).chunk(3, dim=-1)
-            shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = self.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
+            shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = mod_self[1](silu_emb).chunk(3, dim=-1)
+            shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = mod_cross[1](silu_emb).chunk(3, dim=-1)
+            shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = mod_mlp[1](silu_emb).chunk(3, dim=-1)
 
         # Reshape tensors from (B, T, D) to (B, T, 1, 1, D) for broadcasting
         shift_self_attn_B_T_1_1_D = rearrange(shift_self_attn_B_T_D, "b t d -> b t 1 1 d")
