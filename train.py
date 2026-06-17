@@ -831,7 +831,7 @@ if __name__ == '__main__':
 
     # Might be useful because we set things in fp16 / bf16 without explicitly enabling Deepspeed fp16 mode.
     # Unsure if really needed.
-    communication_data_type = config['lora']['dtype'] if 'lora' in config else config['model']['dtype']
+    communication_data_type = config['adapter']['dtype'] if 'adapter' in config else config['model']['dtype']
     model_engine.communication_data_type = communication_data_type
 
     train_dataloader = dataset_util.PipelineDataLoader(train_data, model_engine, model_engine.gradient_accumulation_steps(), model)

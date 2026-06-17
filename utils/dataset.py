@@ -1306,17 +1306,23 @@ def _worker_init_fn(worker_id):
     _reopen_caches_readonly(dataset)
 
 
-def _reopen_caches_readonly(obj):
+def _reopen_caches_readonly(obj, visited=None):
     """Recursively find Cache objects and reopen their SQLite connections read-only."""
+    if visited is None:
+        visited = set()
+    obj_id = id(obj)
+    if obj_id in visited:
+        return
+    visited.add(obj_id)
     from utils.cache import Cache
     if isinstance(obj, Cache):
         obj.init_readonly()
     elif hasattr(obj, '__dict__'):
         for v in obj.__dict__.values():
-            _reopen_caches_readonly(v)
+            _reopen_caches_readonly(v, visited)
     elif isinstance(obj, (list, tuple)):
         for item in obj:
-            _reopen_caches_readonly(item)
+            _reopen_caches_readonly(item, visited)
 
 
 # DataLoader that divides batches into microbatches for gradient accumulation steps when doing

@@ -21,7 +21,7 @@ NS_STEPS = 5
 
 
 def has_inf_or_nan(x):
-    s = x.sum()
+    s = x.sum(dtype=torch.float32)
     return s.isinf() or s.isnan()
 
 
@@ -501,7 +501,8 @@ class GenericOptim(Optimizer):
             # Because we did non_blocking transfer in GPU -> CPU direction.
             # Use an event instead of full synchronize so the next micro-batch's
             # forward can overlap with the tail of this transfer.
-            self._sync_event = torch.cuda.Event()
+            if not hasattr(self, '_sync_event') or self._sync_event is None:
+                self._sync_event = torch.cuda.Event()
             self._sync_event.record()
             self._sync_event.synchronize()
 

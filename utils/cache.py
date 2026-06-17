@@ -150,6 +150,10 @@ class Cache:
         self.con.execute('INSERT INTO items VALUES(?, ?)', item)
         self.shard_index += 1
 
+        # periodic commit to avoid WAL growth and data loss on crash
+        if self.shard_index % 1000 == 0 or (self.shard_file is not None and self.shard_file.tell() > 500_000_000):
+            self.con.commit()
+
         # update shard metadata
         size = len(bytes_view)
         entry = (self.offset, size)

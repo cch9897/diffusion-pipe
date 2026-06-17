@@ -1020,7 +1020,7 @@ class LLMAdapterLayer(nn.Module):
                 target_attention_mask=t5_attn_mask,
                 source_attention_mask=attn_mask,
             )
-            crossattn_emb[~t5_attn_mask.bool()] = 0
+            crossattn_emb = crossattn_emb.masked_fill(~t5_attn_mask.bool().unsqueeze(-1), 0)
 
         # Only crossattn_emb changed; x and other tensors are unchanged.
         crossattn_emb = crossattn_emb.contiguous()
