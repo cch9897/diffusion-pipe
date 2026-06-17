@@ -95,8 +95,9 @@ def _apply_rotary_pos_emb_base(
         if tensor_format == "bshd":
             cos_ = cos_.transpose(0, 1)
             sin_ = sin_.transpose(0, 1)
-        cos_ = cos_.to(t.dtype)
-        sin_ = sin_.to(t.dtype)
+        if cos_.dtype != t.dtype:
+            cos_ = cos_.to(t.dtype)
+            sin_ = sin_.to(t.dtype)
         rot_dim = cos_.shape[-1]
         t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
         t = (t * cos_) + (_rotate_half(t, interleaved) * sin_)
@@ -396,13 +397,16 @@ class Attention(nn.Module):
         self.query_dim = query_dim
         self.context_dim = context_dim
 
-        self.q_proj = nn.Linear(query_dim, inner_dim, bias=False)
+        if self.is_selfattn:
+            # Fused QKV: a single GEMM replaces three separate q/k/v projections.
+            # state_dict load/save remaps between qkv_proj and the legacy q_proj/k_proj/v_proj keys.
+            self.qkv_proj = nn.Linear(query_dim, 3 * inner_dim, bias=False)
+        else:
+            self.q_proj = nn.Linear(query_dim, inner_dim, bias=False)
+            self.k_proj = nn.Linear(context_dim, inner_dim, bias=False)
+            self.v_proj = nn.Linear(context_dim, inner_dim, bias=False)
         self.q_norm = RMSNorm(self.head_dim, eps=1e-6)
-
-        self.k_proj = nn.Linear(context_dim, inner_dim, bias=False)
         self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
-
-        self.v_proj = nn.Linear(context_dim, inner_dim, bias=False)
         self.v_norm = nn.Identity()
 
         self.output_proj = nn.Linear(inner_dim, query_dim, bias=False)
@@ -428,11 +432,15 @@ class Attention(nn.Module):
         self.init_weights()
 
     def init_weights(self) -> None:
-        std = 1.0 / math.sqrt(self._query_dim)
-        torch.nn.init.trunc_normal_(self.q_proj.weight, std=std, a=-3 * std, b=3 * std)
-        std = 1.0 / math.sqrt(self._context_dim)
-        torch.nn.init.trunc_normal_(self.k_proj.weight, std=std, a=-3 * std, b=3 * std)
-        torch.nn.init.trunc_normal_(self.v_proj.weight, std=std, a=-3 * std, b=3 * std)
+        if self.is_selfattn:
+            std = 1.0 / math.sqrt(self._query_dim)
+            torch.nn.init.trunc_normal_(self.qkv_proj.weight, std=std, a=-3 * std, b=3 * std)
+        else:
+            std = 1.0 / math.sqrt(self._query_dim)
+            torch.nn.init.trunc_normal_(self.q_proj.weight, std=std, a=-3 * std, b=3 * std)
+            std = 1.0 / math.sqrt(self._context_dim)
+            torch.nn.init.trunc_normal_(self.k_proj.weight, std=std, a=-3 * std, b=3 * std)
+            torch.nn.init.trunc_normal_(self.v_proj.weight, std=std, a=-3 * std, b=3 * std)
 
         std = 1.0 / math.sqrt(self._inner_dim)
         torch.nn.init.trunc_normal_(self.output_proj.weight, std=std, a=-3 * std, b=3 * std)
@@ -447,28 +455,24 @@ class Attention(nn.Module):
         context: Optional[torch.Tensor] = None,
         rope_emb: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q = self.q_proj(x)
-        context = x if context is None else context
-        k = self.k_proj(context)
-        v = self.v_proj(context)
+        if self.is_selfattn:
+            qkv = self.qkv_proj(x)
+            q, k, v = qkv.chunk(3, dim=-1)
+        else:
+            q = self.q_proj(x)
+            context = x if context is None else context
+            k = self.k_proj(context)
+            v = self.v_proj(context)
         q, k, v = map(
             lambda t: rearrange(t, "b ... (h d) -> b ... h d", h=self.n_heads, d=self.head_dim),
             (q, k, v),
         )
-
-        def apply_norm_and_rotary_pos_emb(
-            q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rope_emb: Optional[torch.Tensor]
-        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-            v = self.v_norm(v)
-            if self.is_selfattn and rope_emb is not None:  # only apply to self-attention!
-                q = apply_rotary_pos_emb(q, rope_emb, tensor_format=self.qkv_format, fused=False)
-                k = apply_rotary_pos_emb(k, rope_emb, tensor_format=self.qkv_format, fused=False)
-            return q, k, v
-
-        q, k, v = apply_norm_and_rotary_pos_emb(q, k, v, rope_emb)
-
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        v = self.v_norm(v)
+        if self.is_selfattn and rope_emb is not None:  # only apply to self-attention!
+            q = apply_rotary_pos_emb(q, rope_emb, tensor_format=self.qkv_format, fused=False)
+            k = apply_rotary_pos_emb(k, rope_emb, tensor_format=self.qkv_format, fused=False)
         return q, k, v
 
     def compute_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -1022,26 +1026,18 @@ class Block(nn.Module):
         self.mlp = GPT2FeedForward(x_dim, int(x_dim * mlp_ratio))
 
         self.use_adaln_lora = use_adaln_lora
+        self.adaln_lora_dim = adaln_lora_dim
         if self.use_adaln_lora:
-            self.adaln_modulation_self_attn = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(x_dim, adaln_lora_dim, bias=False),
-                nn.Linear(adaln_lora_dim, 3 * x_dim, bias=False),
-            )
-            self.adaln_modulation_cross_attn = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(x_dim, adaln_lora_dim, bias=False),
-                nn.Linear(adaln_lora_dim, 3 * x_dim, bias=False),
-            )
-            self.adaln_modulation_mlp = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(x_dim, adaln_lora_dim, bias=False),
-                nn.Linear(adaln_lora_dim, 3 * x_dim, bias=False),
-            )
+            # Fused AdaLN: two GEMMs replace six small Linears (3 branches × 2 layers).
+            # Bottleneck is 3*adaln_lora_dim (non-shared) to preserve per-branch capacity.
+            # Output is 9*D = 3 branches × (shift, scale, gate), split in forward.
+            # state_dict load/save remaps between adaln_modulation_1/2 and the legacy
+            # adaln_modulation_{self_attn,cross_attn,mlp}.1/.2 keys.
+            adaln_lora_dim_total = 3 * adaln_lora_dim
+            self.adaln_modulation_1 = nn.Linear(x_dim, adaln_lora_dim_total, bias=False)
+            self.adaln_modulation_2 = nn.Linear(adaln_lora_dim_total, 9 * x_dim, bias=False)
         else:
-            self.adaln_modulation_self_attn = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
-            self.adaln_modulation_cross_attn = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
-            self.adaln_modulation_mlp = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
+            self.adaln_modulation = nn.Linear(x_dim, 9 * x_dim, bias=False)
 
     def reset_parameters(self) -> None:
         self.layer_norm_self_attn.reset_parameters()
@@ -1050,16 +1046,10 @@ class Block(nn.Module):
 
         if self.use_adaln_lora:
             std = 1.0 / math.sqrt(self.x_dim)
-            torch.nn.init.trunc_normal_(self.adaln_modulation_self_attn[1].weight, std=std, a=-3 * std, b=3 * std)
-            torch.nn.init.trunc_normal_(self.adaln_modulation_cross_attn[1].weight, std=std, a=-3 * std, b=3 * std)
-            torch.nn.init.trunc_normal_(self.adaln_modulation_mlp[1].weight, std=std, a=-3 * std, b=3 * std)
-            torch.nn.init.zeros_(self.adaln_modulation_self_attn[2].weight)
-            torch.nn.init.zeros_(self.adaln_modulation_cross_attn[2].weight)
-            torch.nn.init.zeros_(self.adaln_modulation_mlp[2].weight)
+            torch.nn.init.trunc_normal_(self.adaln_modulation_1.weight, std=std, a=-3 * std, b=3 * std)
+            torch.nn.init.zeros_(self.adaln_modulation_2.weight)
         else:
-            torch.nn.init.zeros_(self.adaln_modulation_self_attn[1].weight)
-            torch.nn.init.zeros_(self.adaln_modulation_cross_attn[1].weight)
-            torch.nn.init.zeros_(self.adaln_modulation_mlp[1].weight)
+            torch.nn.init.zeros_(self.adaln_modulation.weight)
 
     def init_weights(self) -> None:
         self.reset_parameters()
@@ -1079,27 +1069,31 @@ class Block(nn.Module):
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
-        # adaln_modulation_* are nn.Sequential(SiLU, Linear[, Linear]). The SiLU at index 0
-        # is identical across all three branches and takes the same input, so apply it once
-        # here and call only the remaining Linear(s) for each branch.
+        # Fused AdaLN: one (or two) GEMM(s) produce all 9 modulation vectors at once.
+        # Output is 9*D, reshaped to (3, 3, B, T, D): [branch][shift/scale/gate].
+        # adaln_lora_B_T_3D is broadcast-added to each branch's 3D segment.
         silu_emb = F.silu(emb_B_T_D)
-        mod_self = self.adaln_modulation_self_attn
-        mod_cross = self.adaln_modulation_cross_attn
-        mod_mlp = self.adaln_modulation_mlp
         if self.use_adaln_lora:
-            shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
-                mod_self[2](mod_self[1](silu_emb)) + adaln_lora_B_T_3D
-            ).chunk(3, dim=-1)
-            shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = (
-                mod_cross[2](mod_cross[1](silu_emb)) + adaln_lora_B_T_3D
-            ).chunk(3, dim=-1)
-            shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = (
-                mod_mlp[2](mod_mlp[1](silu_emb)) + adaln_lora_B_T_3D
-            ).chunk(3, dim=-1)
+            mod_9D = self.adaln_modulation_2(self.adaln_modulation_1(silu_emb))
+            # (B, T, 9D) -> (3, 3, B, T, D): branch=0..2 (self/cross/mlp), ssg=0..2 (shift/scale/gate)
+            mod_3_3_B_T_D = mod_9D.reshape(mod_9D.shape[0], mod_9D.shape[1], 3, 3, -1).permute(2, 3, 0, 1, 4)
+            # adaln_lora_B_T_3D is (B,T,3D); reshape to (1,3,B,T,D) so it broadcasts across
+            # the 3 branches (dim 0) and matches the (shift,scale,gate) split (dim 1).
+            adaln_lora_1_3_B_T_D = adaln_lora_B_T_3D.reshape(*adaln_lora_B_T_3D.shape[:2], 3, -1).permute(2, 0, 1, 3).unsqueeze(0)
+            mod_3_3_B_T_D = mod_3_3_B_T_D + adaln_lora_1_3_B_T_D
         else:
-            shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = mod_self[1](silu_emb).chunk(3, dim=-1)
-            shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = mod_cross[1](silu_emb).chunk(3, dim=-1)
-            shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = mod_mlp[1](silu_emb).chunk(3, dim=-1)
+            mod_9D = self.adaln_modulation(silu_emb)
+            mod_3_3_B_T_D = mod_9D.reshape(mod_9D.shape[0], mod_9D.shape[1], 3, 3, -1).permute(2, 3, 0, 1, 4)
+
+        shift_self_attn_B_T_D = mod_3_3_B_T_D[0, 0]
+        scale_self_attn_B_T_D = mod_3_3_B_T_D[0, 1]
+        gate_self_attn_B_T_D = mod_3_3_B_T_D[0, 2]
+        shift_cross_attn_B_T_D = mod_3_3_B_T_D[1, 0]
+        scale_cross_attn_B_T_D = mod_3_3_B_T_D[1, 1]
+        gate_cross_attn_B_T_D = mod_3_3_B_T_D[1, 2]
+        shift_mlp_B_T_D = mod_3_3_B_T_D[2, 0]
+        scale_mlp_B_T_D = mod_3_3_B_T_D[2, 1]
+        gate_mlp_B_T_D = mod_3_3_B_T_D[2, 2]
 
         # Reshape tensors from (B, T, D) to (B, T, 1, 1, D) for broadcasting
         shift_self_attn_B_T_1_1_D = rearrange(shift_self_attn_B_T_D, "b t d -> b t 1 1 d")
@@ -1475,6 +1469,11 @@ class MiniTrainDIT(nn.Module):
             fps=fps,
             padding_mask=padding_mask,
         )
+
+        # Cast rope_emb to model dtype once to avoid per-block float32->bf16 casts.
+        # _apply_rotary_pos_emb_base will no-op the cast if dtypes already match.
+        if rope_emb_L_1_1_D is not None:
+            rope_emb_L_1_1_D = rope_emb_L_1_1_D.to(x_B_T_H_W_D.dtype)
 
         if timesteps_B_T.ndim == 1:
             timesteps_B_T = timesteps_B_T.unsqueeze(1)

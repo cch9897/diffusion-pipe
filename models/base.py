@@ -309,10 +309,19 @@ class BasePipeline(CommonPipeline):
             k = re.sub(r'^(transformer|diffusion_model)\.', '', k)
             # Replace weight at end for LoRA format
             k = re.sub(r'\.weight$', '.default.weight', k)
+            modified_state_dict[k] = v
+        # Allow pipeline subclasses to remap legacy adapter keys (e.g. fused QKV/AdaLN).
+        # Done after prefix stripping and .default suffix so the remap can match the
+        # model's parameter names exactly.
+        modified_state_dict = self._remap_adapter_state_dict(modified_state_dict)
+        for k in list(modified_state_dict.keys()):
             if k not in model_parameters:
                 raise RuntimeError(f'modified_state_dict key {k} is not in the model parameters')
-            modified_state_dict[k] = v
         self.transformer.load_state_dict(modified_state_dict, strict=False)
+
+    def _remap_adapter_state_dict(self, state_dict):
+        """Hook for pipelines to remap legacy adapter keys. Default: no-op."""
+        return state_dict
 
     def load_and_fuse_adapter(self, path):
         peft_config = peft.LoraConfig.from_pretrained(path)

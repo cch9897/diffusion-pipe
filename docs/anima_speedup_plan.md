@@ -3,12 +3,37 @@
 本文件记录暂未实施、需后续分析的优化项。已实施的项目直接进了代码:
 - A/B/C(RoPE cos/sin 上提、AdaLN SiLU 去重、移除 RMSNorm autocast 装饰器):见 `models/cosmos_predict2_modeling.py`。
 - H(per-block `torch.compile`,opt-in,见下方):见 `models/cosmos_predict2.py:to_layers`。
+- **QKV 融合**(self-attn 三投影→单 GEMM)、**AdaLN 融合**(三组 modulation→两个 Linear)、**RoPE dtype cast 上提**(plan F 精确化版):已实施,见下方"已实施"节。
 
 适用范围:Anima 与 Cosmos-Predict2 共用的 `MiniTrainDIT`(`models/cosmos_predict2_modeling.py`)。Anima 配置见 `docs/supported_models.md` 的 Anima 节。
 
 ---
 
-## G. 把每个 Block 的三组 AdaLN modulation Linear 融成一组 GEMM
+## 已实施:QKV 融合 + AdaLN 融合 + RoPE dtype 上提
+
+### QKV 融合(self-attn)
+
+`Attention.__init__`(`modeling.py`):self-attn(`is_selfattn=True`)用单一 `qkv_proj = Linear(D, 3*D, bias=False)` 代替 `q_proj`/`k_proj`/`v_proj`。`compute_qkv` 一次投影后 `chunk(3, dim=-1)`。cross-attn 输入维度不同(q 来自 x、k/v 来自 crossattn_emb),保持三投影不变。
+
+**state_dict 兼容**:`_remap_state_dict_keys`(`cosmos_predict2.py`)在 `load_diffusion_model` 中把旧 `q_proj`/`k_proj`/`v_proj` 权重 cat(dim=0)进 `qkv_proj`。`save_model`/`save_adapter` 通过 `_split_state_dict_keys`/`_split_lora_keys` 反向拆分,保证 ComfyUI 侧(仍是三投影)可加载。
+
+**LoRA 兼容**:旧 LoRA(q_proj/k_proj/v_proj 各有 rank R)加载到新 qkv_proj(rank R)时,lora_B 按 dim=0 cat(3×(D,R)→(3D,R),精确),lora_A 取三组平均(3×(R,D)→(R,D),有损)。保存时反向:lora_A 复制 3 份,lora_B 按 dim=0 切 3 段。`_remap_lora_keys`/`_split_lora_keys` 自动处理,加载时打印 warning。
+
+### AdaLN 融合
+
+`Block.__init__`(`modeling.py`):`use_adaln_lora=True` 时三组 `Sequential(SiLU, Linear(D,ald), Linear(ald,3D))` 合并为 `adaln_modulation_1 = Linear(D, 3*ald)` + `adaln_modulation_2 = Linear(3*ald, 9*D)`。瓶颈不共享(3*ald=768),保留原容量。forward 里一次投影,reshape 成 `(3, 3, B, T, D)` 切出 9 个向量,adaln_lora 以 `(1,3,B,T,D)` 广播相加。`use_adaln_lora=False` 时合并为单一 `Linear(D, 9*D)`。
+
+**state_dict 兼容**:加载时 `_remap_state_dict_keys` 把三组 layer-1 权重 cat(dim=0)、layer-2 权重放 block-diagonal。保存反向拆分。LoRA 兼容同 QKV(lora_A 平均/复制,lora_B cat/切分)。
+
+**学习率分组**:`get_param_groups` 的 `.adaln_modulation` 子串匹配仍命中新名 `adaln_modulation_1/2`。但 `self_attn_lr`/`cross_attn_lr`/`mlp_lr` 对 modulation 失效(三组合一后无法分头 LR),合并后 adaln 全部走 `mod_lr`。
+
+### RoPE dtype cast 上提
+
+`InitialLayer.forward`(`cosmos_predict2.py`):拿到 `rope_emb_L_1_1_D` 后立即 `.to(AUTOCAST_DTYPE)` 转 bf16 一次。`_apply_rotary_pos_emb_base`(`modeling.py`)的 precomputed 分支改为仅在 dtype 不一致时才 cast(`if cos_.dtype != t.dtype`)。消除 28 blocks × 2 × 2 = 112 次/step 的 float32→bf16 cast。`MiniTrainDIT.forward` 同步加了 cast。
+
+---
+
+## G. 把每个 Block 的三组 AdaLN modulation Linear 融成一组 GEMM —— 已实施(见上方"已实施"节)
 
 ### 现状
 
@@ -96,6 +121,6 @@ if self.model_config.get('torch_compile', False):
 
 ## 后续可顺手做的小项(参考,不在 G/H 范围)
 
-- **D. LLM Adapter 的 (cos, sin) 缓存**(`models/llm_adapter.py:193-196`):6 层共用同一对 cos/sin,可按 seq_len 缓存。收益小,改动也小。
-- **E. `padding_mask` 常量缓存**(`models/cosmos_predict2.py:556`):始终为零,可按 (B, H, W, dtype) 缓存或干脆移除 `concat_padding_mask` 通道(后者动模型结构,涉及 in_channels)。
-- **F. `torch_attention_op` 用 `transpose` 代替 einops `rearrange`**(`models/cosmos_predict2_modeling.py:299-306`):batch=1 的 LoRA 训练下 einops Python 解析开销可见。
+- **D. LLM Adapter 的 (cos, sin) 缓存**(`models/llm_adapter.py:193-196`):6 层共用同一对 cos/sin,可按 seq_len 缓存。收益 <1%,不纳入。
+- **E. `padding_mask` 常量缓存**(`models/cosmos_predict2.py:556`):始终为零,可按 (B, H, W, dtype) 缓存或干脆移除 `concat_padding_mask` 通道(后者动模型结构,涉及 in_channels,破坏 state_dict 兼容)。风险/收益比差,不纳入。
+- **F. `torch_attention_op` 用 `transpose` 代替 einops `rearrange`**(`models/cosmos_predict2_modeling.py:299-306`):batch=1 的 LoRA 训练下 einops Python 解析开销可见。`torch_compile=true` 时 dynamo 能编译 einops 为等效 transpose,手动改在非 compile 路径收益 <2%、compile 路径无收益。不纳入。**注:RoPE dtype cast 优化(见上方"已实施"节)覆盖了同区域的 dtype cast 开销。**

@@ -12,6 +12,7 @@
 
 import math
 import os.path
+import re
 
 import torch
 from torch import nn
@@ -33,6 +34,315 @@ KEEP_IN_HIGH_PRECISION = ['x_embedder', 't_embedder', 't_embedding_norm', 'final
 
 MULTISCALE_LOSS_THRESHOLDS = [size * 0.9 for size in [1024]]
 MULTISCALE_LOSS_THRESHOLDS.sort()
+
+
+def _remap_state_dict_keys(state_dict):
+    """Remap legacy checkpoint keys to the fused module layout used by MiniTrainDIT.
+
+    Handles two fusions:
+    1. QKV: self_attn q_proj/k_proj/v_proj (3 separate Linears) -> qkv_proj (single Linear).
+       Weights are concatenated along output dim (dim 0): [q_w; k_w; v_w].
+    2. AdaLN: three adaln_modulation_{self_attn,cross_attn,mlp} Sequentials -> two Linears
+       (adaln_modulation_1, adaln_modulation_2). Layer-1 weights are concatenated along dim 0;
+       layer-2 weights are placed block-diagonally (each branch keeps its own bottleneck slice).
+
+    Idempotent: if the state_dict already uses fused keys, it is returned unchanged.
+    """
+    new_sd = {}
+    # Collect keys we need to merge so we can skip the individual ones.
+    skip_keys = set()
+
+    # --- QKV fusion ---
+    # Find all blocks.N.self_attn.q_proj.weight and merge with k_proj/v_proj
+    qkv_pattern_re = re.compile(r'^(.+\.self_attn)\.q_proj\.weight$')
+    for k in list(state_dict.keys()):
+        m = qkv_pattern_re.match(k)
+        if not m:
+            continue
+        prefix = m.group(1)
+        qkv_key = f'{prefix}.qkv_proj.weight'
+        if qkv_key in state_dict:
+            # Already fused in checkpoint
+            continue
+        q_w = state_dict[f'{prefix}.q_proj.weight']
+        k_w = state_dict[f'{prefix}.k_proj.weight']
+        v_w = state_dict[f'{prefix}.v_proj.weight']
+        new_sd[qkv_key] = torch.cat([q_w, k_w, v_w], dim=0)
+        skip_keys.update({f'{prefix}.q_proj.weight', f'{prefix}.k_proj.weight', f'{prefix}.v_proj.weight'})
+
+    # --- AdaLN fusion ---
+    adaln_branches = ['self_attn', 'cross_attn', 'mlp']
+    adaln_pattern_re = re.compile(r'^(.+)\.adaln_modulation_self_attn\.1\.weight$')
+    for k in list(state_dict.keys()):
+        m = adaln_pattern_re.match(k)
+        if not m:
+            continue
+        prefix = m.group(1)
+        mod1_key = f'{prefix}.adaln_modulation_1.weight'
+        mod2_key = f'{prefix}.adaln_modulation_2.weight'
+        if mod1_key in state_dict:
+            # Already fused
+            continue
+        # use_adaln_lora=True path: two layers (1 and 2)
+        layer1_keys = [f'{prefix}.adaln_modulation_{b}.1.weight' for b in adaln_branches]
+        layer2_keys = [f'{prefix}.adaln_modulation_{b}.2.weight' for b in adaln_branches]
+        if all(lk in state_dict for lk in layer1_keys + layer2_keys):
+            # Layer 1: cat along dim 0 -> (3*adaln_lora_dim, D)
+            new_sd[mod1_key] = torch.cat([state_dict[lk] for lk in layer1_keys], dim=0)
+            # Layer 2: block-diagonal -> (9*D, 3*adaln_lora_dim)
+            w2_list = [state_dict[lk] for lk in layer2_keys]  # each (3*D, adaln_lora_dim)
+            D = w2_list[0].shape[0] // 3
+            adaln_lora_dim = w2_list[0].shape[1]
+            total_out = 9 * D
+            total_mid = 3 * adaln_lora_dim
+            w2 = torch.zeros(total_out, total_mid, dtype=w2_list[0].dtype, device=w2_list[0].device)
+            for i, w in enumerate(w2_list):
+                w2[i*3*D:(i+1)*3*D, i*adaln_lora_dim:(i+1)*adaln_lora_dim] = w
+            new_sd[mod2_key] = w2
+            for lk in layer1_keys + layer2_keys:
+                skip_keys.add(lk)
+        else:
+            # use_adaln_lora=False path: single layer (1) -> adaln_modulation (9*D, D)
+            single_keys = [f'{prefix}.adaln_modulation_{b}.1.weight' for b in adaln_branches]
+            if all(sk in state_dict for sk in single_keys):
+                new_sd[f'{prefix}.adaln_modulation.weight'] = torch.cat([state_dict[sk] for sk in single_keys], dim=0)
+                for sk in single_keys:
+                    skip_keys.add(sk)
+
+    # Copy remaining keys
+    for k, v in state_dict.items():
+        if k not in skip_keys:
+            new_sd.setdefault(k, v)
+
+    return new_sd
+
+
+def _split_state_dict_keys(state_dict):
+    """Inverse of _remap_state_dict_keys: split fused keys back to legacy layout.
+
+    Used by save_model/save_adapter so checkpoints stay compatible with ComfyUI
+    (which uses the original 3-projection / 3-modulation layout).
+    """
+    new_sd = {}
+    skip_keys = set()
+
+    # --- QKV split ---
+    qkv_pattern_re = re.compile(r'^(.+\.self_attn)\.qkv_proj\.weight$')
+    for k in list(state_dict.keys()):
+        m = qkv_pattern_re.match(k)
+        if not m:
+            continue
+        prefix = m.group(1)
+        qkv_w = state_dict[k]
+        inner_dim = qkv_w.shape[0] // 3
+        new_sd[f'{prefix}.q_proj.weight'] = qkv_w[:inner_dim]
+        new_sd[f'{prefix}.k_proj.weight'] = qkv_w[inner_dim:2*inner_dim]
+        new_sd[f'{prefix}.v_proj.weight'] = qkv_w[2*inner_dim:]
+        skip_keys.add(k)
+
+    # --- AdaLN split ---
+    adaln1_pattern_re = re.compile(r'^(.+)\.adaln_modulation_1\.weight$')
+    adaln_pattern_re = re.compile(r'^(.+)\.adaln_modulation\.weight$')
+    for k in list(state_dict.keys()):
+        m = adaln1_pattern_re.match(k)
+        if m:
+            prefix = m.group(1)
+            mod1_w = state_dict[k]  # (3*adaln_lora_dim, D)
+            mod2_w = state_dict[f'{prefix}.adaln_modulation_2.weight']  # (9*D, 3*adaln_lora_dim)
+            adaln_lora_dim = mod1_w.shape[0] // 3
+            D = mod2_w.shape[0] // 9
+            for i, b in enumerate(['self_attn', 'cross_attn', 'mlp']):
+                new_sd[f'{prefix}.adaln_modulation_{b}.1.weight'] = mod1_w[i*adaln_lora_dim:(i+1)*adaln_lora_dim]
+                new_sd[f'{prefix}.adaln_modulation_{b}.2.weight'] = mod2_w[i*3*D:(i+1)*3*D, i*adaln_lora_dim:(i+1)*adaln_lora_dim]
+            skip_keys.add(k)
+            skip_keys.add(f'{prefix}.adaln_modulation_2.weight')
+            continue
+        m = adaln_pattern_re.match(k)
+        if m:
+            prefix = m.group(1)
+            mod_w = state_dict[k]  # (9*D, D)
+            D = mod_w.shape[1]
+            for i, b in enumerate(['self_attn', 'cross_attn', 'mlp']):
+                new_sd[f'{prefix}.adaln_modulation_{b}.1.weight'] = mod_w[i*3*D:(i+1)*3*D]
+            skip_keys.add(k)
+
+    for k, v in state_dict.items():
+        if k not in skip_keys:
+            new_sd.setdefault(k, v)
+
+    return new_sd
+
+
+def _remap_lora_keys(state_dict):
+    """Remap legacy LoRA adapter keys to the fused module layout.
+
+    Handles two key formats:
+    - PEFT state dict: ...self_attn.q_proj.lora_A.weight (no adapter name)
+    - After load_adapter_weights transform: ...self_attn.q_proj.lora_A.default.weight
+
+    QKV: q_proj/k_proj/v_proj -> qkv_proj. The old 3 LoRAs each have rank R;
+    the fused qkv_proj LoRA also has rank R. lora_B cats naturally (3×(D,R) -> (3D,R)),
+    but lora_A (3×(R,D) -> (R,D)) requires averaging — this is lossy but the best
+    rank-R approximation. A warning is printed.
+
+    AdaLN: adaln_modulation_{self,cross,mlp}.{1,2} -> adaln_modulation_{1,2}.
+    Layer-1 lora_A cats along dim 0 (3×(R,D) -> (3R,D)) and layer-2 lora_B is
+    block-diagonal (3×(3D,R) -> (9D,3R)) — this increases the fused rank to 3R,
+    which requires the PEFT config to use rank 3R for these modules. Since
+    adaln modulation typically uses a small rank, this is handled by padding
+    lora_A to match: if the target rank < 3R, we average; if equal, we cat.
+    """
+    import warnings
+    new_sd = {}
+    skip_keys = set()
+    
+    _SUFFIX = r'(?:\.([^.]+))?\.weight$'
+
+    # --- QKV LoRA remap ---
+    qkv_lora_re = re.compile(r'^(.+\.self_attn)\.q_proj\.(lora_[AB])' + _SUFFIX)
+    for k in list(state_dict.keys()):
+        m = qkv_lora_re.match(k)
+        if not m:
+            continue
+        prefix = m.group(1)
+        lora_type = m.group(2)
+        adapter_name = m.group(3)
+        mid = f'.{adapter_name}' if adapter_name else ''
+        fused_key = f'{prefix}.qkv_proj.{lora_type}{mid}.weight'
+        if fused_key in state_dict or fused_key in new_sd:
+            continue
+        q_key = f'{prefix}.q_proj.{lora_type}{mid}.weight'
+        k_key = f'{prefix}.k_proj.{lora_type}{mid}.weight'
+        v_key = f'{prefix}.v_proj.{lora_type}{mid}.weight'
+        if not all(kk in state_dict for kk in [q_key, k_key, v_key]):
+            continue
+        q_w, k_w, v_w = state_dict[q_key], state_dict[k_key], state_dict[v_key]
+        if lora_type == 'lora_A':
+            # Old: 3 × (R, D). New: (R, D). Average to preserve rank-R capacity.
+            warnings.warn(
+                f'Remapping legacy QKV LoRA: averaging 3 lora_A tensors for {prefix}. '
+                f'This is lossy (rank 3R -> R). Consider retraining with fused qkv_proj.'
+            )
+            new_sd[fused_key] = (q_w + k_w + v_w) / 3.0
+        else:
+            # lora_B: Old 3 × (D, R). New: (3D, R). Cat along dim 0.
+            new_sd[fused_key] = torch.cat([q_w, k_w, v_w], dim=0)
+        skip_keys.update({q_key, k_key, v_key})
+
+    # --- AdaLN LoRA remap ---
+    adaln_branches = ['self_attn', 'cross_attn', 'mlp']
+    adaln_lora_re = re.compile(r'^(.+)\.adaln_modulation_self_attn\.1\.(lora_[AB])' + _SUFFIX)
+    for k in list(state_dict.keys()):
+        m = adaln_lora_re.match(k)
+        if not m:
+            continue
+        prefix = m.group(1)
+        lora_type = m.group(2)
+        adapter_name = m.group(3)
+        mid = f'.{adapter_name}' if adapter_name else ''
+        fused_key_1 = f'{prefix}.adaln_modulation_1.{lora_type}{mid}.weight'
+        fused_key_2 = f'{prefix}.adaln_modulation_2.{lora_type}{mid}.weight'
+        if fused_key_1 in state_dict or fused_key_1 in new_sd:
+            continue
+        layer1_keys = [f'{prefix}.adaln_modulation_{b}.1.{lora_type}{mid}.weight' for b in adaln_branches]
+        layer2_keys = [f'{prefix}.adaln_modulation_{b}.2.{lora_type}{mid}.weight' for b in adaln_branches]
+        if all(kk in state_dict for kk in layer1_keys + layer2_keys):
+            l1_list = [state_dict[kk] for kk in layer1_keys]
+            l2_list = [state_dict[kk] for kk in layer2_keys]
+            if lora_type == 'lora_A':
+                # Old layer1: 3 × (R, D). New: (R, D). Average.
+                new_sd[fused_key_1] = sum(l1_list) / 3.0
+                # Old layer2: 3 × (R, adaln_lora_dim). New: (R, adaln_lora_dim). Average.
+                new_sd[fused_key_2] = sum(l2_list) / 3.0
+            else:
+                # lora_B
+                # Old layer1: 3 × (adaln_lora_dim, R). New: (3*adaln_lora_dim, R). Cat dim 0.
+                new_sd[fused_key_1] = torch.cat(l1_list, dim=0)
+                # Old layer2: 3 × (3D, R). New: (9D, R). Cat dim 0.
+                new_sd[fused_key_2] = torch.cat(l2_list, dim=0)
+            skip_keys.update(layer1_keys + layer2_keys)
+
+    for k, v in state_dict.items():
+        if k not in skip_keys:
+            new_sd.setdefault(k, v)
+    return new_sd
+
+
+def _split_lora_keys(state_dict):
+    """Inverse of _remap_lora_keys: split fused LoRA keys back to legacy layout.
+
+    Used by save_adapter so saved LoRA files stay compatible with ComfyUI's
+    3-projection / 3-modulation layout.
+
+    QKV lora_A (R, D) is replicated 3× (each projection gets the same lora_A).
+    QKV lora_B (3D, R) is sliced into 3 × (D, R).
+    AdaLN lora_A is replicated 3×; lora_B is sliced/cat'd into 3 pieces.
+    """
+    new_sd = {}
+    skip_keys = set()
+    
+    _SUFFIX = r'(?:\.([^.]+))?\.weight$'
+
+    # --- QKV LoRA split ---
+    qkv_lora_re = re.compile(r'^(.+\.self_attn)\.qkv_proj\.(lora_[AB])' + _SUFFIX)
+    for k in list(state_dict.keys()):
+        m = qkv_lora_re.match(k)
+        if not m:
+            continue
+        prefix = m.group(1)
+        lora_type = m.group(2)
+        adapter_name = m.group(3)
+        mid = f'.{adapter_name}' if adapter_name else ''
+        qkv_w = state_dict[k]
+        if lora_type == 'lora_A':
+            # (R, D) -> replicate to 3 × (R, D)
+            for proj in ['q_proj', 'k_proj', 'v_proj']:
+                new_sd[f'{prefix}.{proj}.{lora_type}{mid}.weight'] = qkv_w.clone()
+        else:
+            # (3D, R) -> 3 × (D, R)
+            out_dim = qkv_w.shape[0] // 3
+            for i, proj in enumerate(['q_proj', 'k_proj', 'v_proj']):
+                new_sd[f'{prefix}.{proj}.{lora_type}{mid}.weight'] = qkv_w[i*out_dim:(i+1)*out_dim]
+        skip_keys.add(k)
+
+    # --- AdaLN LoRA split ---
+    adaln_branches = ['self_attn', 'cross_attn', 'mlp']
+    adaln1_lora_re = re.compile(r'^(.+)\.adaln_modulation_1\.(lora_[AB])' + _SUFFIX)
+    for k in list(state_dict.keys()):
+        m = adaln1_lora_re.match(k)
+        if not m:
+            continue
+        prefix = m.group(1)
+        lora_type = m.group(2)
+        adapter_name = m.group(3)
+        mid = f'.{adapter_name}' if adapter_name else ''
+        mod1_w = state_dict[k]
+        mod2_w = state_dict.get(f'{prefix}.adaln_modulation_2.{lora_type}{mid}.weight')
+        if mod2_w is None:
+            continue
+        if lora_type == 'lora_A':
+            # mod1: (R, D) -> replicate to 3 × (R, D)
+            # mod2: (R, adaln_lora_dim) -> replicate to 3 × (R, adaln_lora_dim)
+            for b in adaln_branches:
+                new_sd[f'{prefix}.adaln_modulation_{b}.1.{lora_type}{mid}.weight'] = mod1_w.clone()
+                new_sd[f'{prefix}.adaln_modulation_{b}.2.{lora_type}{mid}.weight'] = mod2_w.clone()
+        else:
+            # lora_B
+            # mod1: (3*adaln_lora_dim, R) -> 3 × (adaln_lora_dim, R)
+            mid_dim = mod1_w.shape[0] // 3
+            for i, b in enumerate(adaln_branches):
+                new_sd[f'{prefix}.adaln_modulation_{b}.1.{lora_type}{mid}.weight'] = mod1_w[i*mid_dim:(i+1)*mid_dim]
+            # mod2: (9*D, R) -> 3 × (3*D, R)
+            D = mod2_w.shape[0] // 9
+            for i, b in enumerate(adaln_branches):
+                new_sd[f'{prefix}.adaln_modulation_{b}.2.{lora_type}{mid}.weight'] = mod2_w[i*3*D:(i+1)*3*D]
+        skip_keys.add(k)
+        skip_keys.add(f'{prefix}.adaln_modulation_2.{lora_type}{mid}.weight')
+
+    for k, v in state_dict.items():
+        if k not in skip_keys:
+            new_sd.setdefault(k, v)
+    return new_sd
 
 
 def time_shift(mu: float, sigma: float, t: torch.Tensor):
@@ -269,6 +579,10 @@ class CosmosPredict2Pipeline(BasePipeline):
             new_state_dict[k] = v
         state_dict = new_state_dict
 
+        # Remap legacy checkpoint keys (q_proj/k_proj/v_proj -> qkv_proj,
+        # adaln_modulation_{self,cross,mlp} -> adaln_modulation_1/2) to the fused layout.
+        state_dict = _remap_state_dict_keys(state_dict)
+
         dit_config = get_dit_config(state_dict)
 
         if 'llm_adapter_path' in self.model_config:
@@ -315,13 +629,22 @@ class CosmosPredict2Pipeline(BasePipeline):
 
     def save_adapter(self, save_dir, peft_state_dict):
         self.peft_config.save_pretrained(save_dir)
+        # Split fused LoRA keys back to legacy layout for ComfyUI compatibility.
+        peft_state_dict = _split_lora_keys(peft_state_dict)
         # ComfyUI format.
         peft_state_dict = {'diffusion_model.'+k: v for k, v in peft_state_dict.items()}
         safetensors.torch.save_file(peft_state_dict, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})
 
     def save_model(self, save_dir, state_dict):
+        # Split fused keys back to legacy layout for ComfyUI compatibility.
+        state_dict = _split_state_dict_keys(state_dict)
         state_dict = {'net.'+k: v for k, v in state_dict.items()}
         safetensors.torch.save_file(state_dict, save_dir / 'model.safetensors', metadata={'format': 'pt'})
+
+    def _remap_adapter_state_dict(self, state_dict):
+        """Remap legacy LoRA keys (q_proj/k_proj/v_proj -> qkv_proj,
+        adaln_modulation_{self,cross,mlp} -> adaln_modulation_1/2) to the fused layout."""
+        return _remap_lora_keys(state_dict)
 
     def get_preprocess_media_file_fn(self):
         return PreprocessMediaFile(
@@ -588,6 +911,9 @@ class InitialLayer(nn.Module):
         )
         assert extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is None
         assert rope_emb_L_1_1_D is not None
+        # Cast rope_emb to autocast dtype once here so the per-block rotary apply
+        # doesn't repeat the float32->bf16 cast 112 times/step (28 blocks × 2 tensors × 2).
+        rope_emb_L_1_1_D = rope_emb_L_1_1_D.to(AUTOCAST_DTYPE)
 
         if timesteps_B_T.ndim == 1:
             timesteps_B_T = timesteps_B_T.unsqueeze(1)
