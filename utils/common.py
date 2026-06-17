@@ -1,20 +1,19 @@
-from contextlib import contextmanager
 import gc
-import time
 import math
-from pathlib import Path
 import os
+import time
+from contextlib import contextmanager
+from pathlib import Path
 
-import torch
 import deepspeed.comm.comm as dist
 import imageio
+import torch
 from safetensors import safe_open
 
-
 DTYPE_MAP = {
-    'float32': torch.float32,
-    'float16': torch.float16,
-    'bfloat16': torch.bfloat16,
+    'float32': torch.float32, 'fp32': torch.float32,
+    'float16': torch.float16, 'fp16': torch.float16,
+    'bfloat16': torch.bfloat16, 'bf16': torch.bfloat16,
     'float8': torch.float8_e4m3fn,
     'float8_e4m3fn': torch.float8_e4m3fn,
     'float8_e5m2': torch.float8_e5m2,

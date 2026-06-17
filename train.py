@@ -1,38 +1,40 @@
 import argparse
 import os
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True,garbage_collection_threshold:0.6')
-import wandb
-from datetime import datetime, timezone
-import shutil
-import glob
-import time
-import random
-import json
-import inspect
-from pathlib import Path
-from collections import defaultdict
 
-import toml
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True,garbage_collection_threshold:0.6')
+import glob
+import inspect
+import json
+import random
+import shutil
+import time
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+
 import deepspeed
+import toml
+import torch
+import wandb
 from deepspeed import comm as dist
 from deepspeed.runtime.pipe import module as ds_pipe_module
-import torch
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+import multiprocess as mp
+import numpy as np
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-import multiprocess as mp
-import numpy as np
 
-from utils import dataset as dataset_util
-from utils import common
-from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache
 import utils.saver
+from utils import common
+from utils import dataset as dataset_util
+from utils.common import DTYPE_MAP, empty_cuda_cache, get_rank, is_main_process
 from utils.isolate_rng import isolate_rng
 from utils.patches import apply_patches
-from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
+from utils.unsloth_utils import unsloth_checkpoint
 
 # needed for broadcasting Queue in dataset.py
 mp.current_process().authkey = b'afsaskgfdjh4'
@@ -101,6 +103,8 @@ def set_config_defaults(config):
     config.setdefault('activation_checkpointing', False)
     config.setdefault('reentrant_activation_checkpointing', False)
     if config['activation_checkpointing'] == 'unsloth':
+        # unsloth's gradient checkpointing (Unsloth_Offloaded_Gradient_Checkpointer)
+        # requires reentrant mode because it replays the forward pass during backward.
         config['reentrant_activation_checkpointing'] = True
     config.setdefault('warmup_steps', 0)
     if 'save_dtype' in config:
@@ -942,28 +946,28 @@ if __name__ == '__main__':
         x_axis = examples if config['x_axis_examples'] else step
 
         if is_main_process() and step % config['logging_steps'] == 0:
-            tb_writer.add_scalar(f'train/loss', loss, x_axis)
+            tb_writer.add_scalar('train/loss', loss, x_axis)
             if hasattr(optimizer, '_grad_norm'):
-                tb_writer.add_scalar(f'train/grad_norm', optimizer._grad_norm, x_axis)
+                tb_writer.add_scalar('train/grad_norm', optimizer._grad_norm, x_axis)
             if wandb_enable:
                 wandb.log({'train/loss': loss, 'step': x_axis})
                 if hasattr(optimizer, '_grad_norm'):
                     wandb.log({'train/grad_norm': optimizer._grad_norm, 'step': x_axis})
             if optimizer.__class__.__name__ == 'Prodigy':
                 prodigy_d = get_prodigy_d(optimizer)
-                tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, x_axis)
+                tb_writer.add_scalar('train/prodigy_d', prodigy_d, x_axis)
             if optimizer.__class__.__name__ in ('Automagic', 'GenericOptim'):
                 lrs, avg_lr = _get_automagic_lrs(optimizer)
                 if avg_lr > 0:
-                    tb_writer.add_histogram(f'train/automagic_lrs', lrs, x_axis)
-                    tb_writer.add_scalar(f'train/automagic_avg_lr', avg_lr, x_axis)
+                    tb_writer.add_histogram('train/automagic_lrs', lrs, x_axis)
+                    tb_writer.add_scalar('train/automagic_avg_lr', avg_lr, x_axis)
 
         if (config['eval_every_n_steps'] and step % config['eval_every_n_steps'] == 0) or (finished_epoch and config['eval_every_n_epochs'] and epoch % config['eval_every_n_epochs'] == 0):
             evaluate(model, model_engine, eval_dataloaders, tb_writer, x_axis, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
 
         if finished_epoch:
             if is_main_process():
-                tb_writer.add_scalar(f'train/epoch_loss', epoch_loss/num_steps, epoch)
+                tb_writer.add_scalar('train/epoch_loss', epoch_loss/num_steps, epoch)
                 if wandb_enable:
                     wandb.log({'train/epoch_loss': epoch_loss/num_steps, 'epoch': epoch})
             epoch_loss = 0

@@ -165,7 +165,7 @@ class Cache:
         self.con = sqlite3.connect(
             f'file:{self.metadata_db}?mode=ro', uri=True
         )
-        self.open_files = {}
+        self.open_files = OrderedDict()  # maintain LRU eviction behavior from init()
 
 
     def add(self, item):

@@ -1,34 +1,38 @@
-from typing import Optional
-import sys
 import os.path
+import sys
+from typing import Optional
+
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/HunyuanVideo'))
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
-import torch
-from torch import nn, Tensor
-import torch._inductor.runtime.triton_heuristics
-import peft
-from peft.tuners._buffer_dict import BufferDict
-from transformers import CLIPTextModel, AutoModel
 import deepspeed
-from deepspeed.runtime.pipe.schedule import (
-    SendGrad, RecvActivation, SendActivation, RecvGrad, LoadMicroBatch, ForwardPass, BackwardPass,
-    ReduceTiedGrads, ReduceGrads, OptimizerStep,
-)
-from deepspeed import comm as dist
-from deepspeed.utils import groups
-try:
-    from torch._six import inf
-except ModuleNotFoundError:
-    from torch import inf
-from deepspeed.accelerator import get_accelerator
-
-from . import reduction
 import hyvideo.text_encoder
-from hyvideo.constants import PRECISION_TO_TYPE, TEXT_ENCODER_PATH
-
+import peft
+import torch
+import torch._inductor.runtime.triton_heuristics
 from comfy.ldm.flux.layers import DoubleStreamBlock, SingleStreamBlock, apply_mod
 from comfy.ldm.flux.math import attention
+from deepspeed import comm as dist
+from deepspeed.accelerator import get_accelerator
+from deepspeed.runtime.pipe.schedule import (
+    BackwardPass,
+    ForwardPass,
+    LoadMicroBatch,
+    OptimizerStep,
+    RecvActivation,
+    RecvGrad,
+    ReduceGrads,
+    ReduceTiedGrads,
+    SendActivation,
+    SendGrad,
+)
+from deepspeed.utils import groups
+from hyvideo.constants import PRECISION_TO_TYPE, TEXT_ENCODER_PATH
+from peft.tuners._buffer_dict import BufferDict
+from torch import Tensor, inf, nn
+from transformers import AutoModel, CLIPTextModel
+
+from . import reduction
 
 
 def _move_adapter_to_device_of_base_layer(self, adapter_name: str, device: Optional[torch.device] = None) -> None:

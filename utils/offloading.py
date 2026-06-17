@@ -8,10 +8,11 @@
 # LoRA modules, and therefore when moving parts of the model to/from the GPU we have to take special consideration
 # of the LoRA params which are what is being trained.
 
-from concurrent.futures import ThreadPoolExecutor
 import gc
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
+
 import torch
 import torch.nn as nn
 
@@ -291,6 +292,10 @@ class ModelOffloader(Offloader):
     def wait_for_block(self, block_idx: int):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
+        # Skip block swapping during reentrant checkpointing's second forward pass.
+        # Detection via torch.is_grad_enabled() works because the replay forward runs
+        # under torch.enable_grad() while the initial forward runs under torch.no_grad().
+        # Limitation: custom checkpoint wrappers that change grad state may bypass this.
         if self.reentrant_activation_checkpointing and torch.is_grad_enabled():
             # Second forward pass, don't do block swapping
             return
@@ -301,6 +306,10 @@ class ModelOffloader(Offloader):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
 
+        # Skip block swapping during reentrant checkpointing's second forward pass.
+        # Detection via torch.is_grad_enabled() works because the replay forward runs
+        # under torch.enable_grad() while the initial forward runs under torch.no_grad().
+        # Limitation: custom checkpoint wrappers that change grad state may bypass this.
         if self.reentrant_activation_checkpointing and torch.is_grad_enabled():
             # Second forward pass, don't do block swapping
             return

@@ -19,13 +19,19 @@ from typing import Any, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from einops import repeat
 from einops.layers.torch import Rearrange
 from torch import nn
 from torch.distributed import get_process_group_ranks
 from torchvision import transforms
 
 from .llm_adapter import LLMAdapter
+
+# Optional: transformer_engine DotProductAttention (only needed when backend='transformer_engine')
+try:
+    from transformer_engine.pytorch import DotProductAttention
+except ImportError:
+    DotProductAttention = None
 
 
 def _rotate_half(x: torch.Tensor, interleaved: bool) -> torch.Tensor:
@@ -208,7 +214,7 @@ def apply_rotary_pos_emb(
         tensor_format != "thd" or cu_seqlens is not None
     ), "cu_seqlens must not be None when tensor_format is 'thd'."
 
-    assert fused == False
+    assert fused == False  # fused RoPE not implemented; this path is unreachable
 
     # Unfused THD format
     if tensor_format == "thd":
@@ -420,7 +426,12 @@ class Attention(nn.Module):
         self.output_proj = nn.Linear(inner_dim, query_dim, bias=False)
         self.output_dropout = nn.Dropout(dropout) if dropout > 1e-4 else nn.Identity()
 
-        if self.backend == "transformer_engine":
+        if self.backend == 'transformer_engine':
+            if DotProductAttention is None:
+                raise ImportError(
+                    'transformer_engine is required for backend=transformer_engine. '
+                    'Install with: pip install transformer-engine'
+                )
             self.attn_op = DotProductAttention(
                 self.n_heads,
                 self.head_dim,
