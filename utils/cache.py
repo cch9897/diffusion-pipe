@@ -37,9 +37,8 @@ class Cache:
         except TypeError:
             # Older PyTorch without weights_only parameter
             item = torch.load(buffer, map_location='cpu')
-        except Exception:
-            # Fallback if cached data contains types not supported by weights_only
-            item = torch.load(buffer, map_location='cpu')
+        # Data corruption or disk errors are not caught — they propagate up
+        # so callers can decide whether to retry or clear the cache.
         return item
 
 

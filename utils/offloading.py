@@ -15,6 +15,10 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+# Module-level CUDA stream reused across swap_weight_devices_cuda calls
+# to avoid per-call stream allocation overhead.
+_swap_stream = None
+
 
 def clean_memory_on_device(device: torch.device):
     r"""
@@ -68,7 +72,10 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
 
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
 
-    stream = torch.cuda.Stream()
+    global _swap_stream
+    if _swap_stream is None:
+        _swap_stream = torch.cuda.Stream()
+    stream = _swap_stream
     with torch.cuda.stream(stream):
         # D2H and H2D operate on different tensors, so they can be submitted
         # to the same stream without an intermediate synchronize.

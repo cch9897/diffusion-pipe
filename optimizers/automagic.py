@@ -306,16 +306,18 @@ class Automagic(torch.optim.Optimizer):
                     weight_decay_update = None
 
                 if p.dtype == torch.bfloat16:
-                    # Kahan summation for bfloat16
+                    # Kahan compensated summation for bfloat16 (Neumaier variant)
+                    # Note: update has already been negated by update.mul_(-1) above
                     update.mul_(-1)
                     if weight_decay_update is not None:
                         update.add_(weight_decay_update)
+                    # Neumaier: y = update - compensation; t = p + y; compensation = (t - p) - y; p = t
                     shift = state['shift']
-                    shift.add_(update)
-                    # Use grad as temp buffer
-                    grad.copy_(p.detach())
-                    p.add_(shift)
-                    shift.add_(grad.sub_(p))
+                    y = update - shift
+                    t = p.detach() + y
+                    new_shift = (t - p.detach()) - y
+                    p.copy_(t)
+                    shift.copy_(new_shift)
                 else:
                     if weight_decay_update is not None:
                         p_data_fp32.add_(weight_decay_update)
