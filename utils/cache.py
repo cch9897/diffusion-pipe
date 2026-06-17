@@ -32,7 +32,14 @@ class Cache:
         f.seek(offset)
         byte_string = f.read(size)
         buffer = io.BytesIO(byte_string)
-        item = torch.load(buffer, map_location='cpu')
+        try:
+            item = torch.load(buffer, map_location='cpu', weights_only=True)
+        except TypeError:
+            # Older PyTorch without weights_only parameter
+            item = torch.load(buffer, map_location='cpu')
+        except Exception:
+            # Fallback if cached data contains types not supported by weights_only
+            item = torch.load(buffer, map_location='cpu')
         return item
 
 
@@ -104,6 +111,16 @@ class Cache:
         self.shard_file = None
         self.shard += 1
         self.con.commit()
+
+
+    def warmup(self):
+        """Pre-read all shard files into the OS page cache for faster subsequent reads."""
+        for shard_id in range(self.shard + 1):
+            path = self.path / f'shard_{shard_id}.bin'
+            if path.exists():
+                with open(path, 'rb') as f:
+                    while f.read(1024 * 1024):
+                        pass
 
 
     def add(self, item):

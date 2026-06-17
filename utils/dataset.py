@@ -1007,10 +1007,14 @@ class Dataset:
                 continue  # mask is handled specially below
             features = [example[key] for example in examples]
             if torch.is_tensor(features[0]):
-                shape = features[0].shape
-                if all(f.shape == shape for f in features):
-                    # if we can form a single batched tensor, do it
-                    features = torch.stack(features)
+                if len(features) == 1:
+                    # batch_size=1: avoid stack's memory allocation and copy
+                    features = features[0].unsqueeze(0)
+                else:
+                    shape = features[0].shape
+                    if all(f.shape == shape for f in features):
+                        # if we can form a single batched tensor, do it
+                        features = torch.stack(features)
             ret[key] = features
         # Only some items in the batch might have valid mask.
         masks = [example['mask'] for example in examples]
@@ -1297,6 +1301,7 @@ class PipelineDataLoader:
         self.model_engine = model_engine
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.num_dataloader_workers = num_dataloader_workers
+        self.pin_memory = False  # Can be enabled when not using torch.compile
         self.iter_called = False
         self.eval_quantile = None
         self.epoch = 1
@@ -1346,7 +1351,7 @@ class PipelineDataLoader:
             sampler = None
         self.dataloader = torch.utils.data.DataLoader(
             self.dataset,
-            pin_memory=False,
+            pin_memory=self.pin_memory,
             batch_size=None,
             sampler=sampler,
             num_workers=self.num_dataloader_workers,
@@ -1379,7 +1384,7 @@ class PipelineDataLoader:
         dest_rank = grid.stage_to_global(model_engine.num_stages - 1)
         assert src_rank in grid.pp_group
         assert dest_rank in grid.pp_group
-        target = target.to('cuda')  # must be on GPU to broadcast
+        target = target.to('cuda', non_blocking=True)  # must be on GPU to broadcast
 
         if model_engine.is_first_stage():
             dist.send(target, dest_rank)

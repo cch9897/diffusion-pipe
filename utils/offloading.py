@@ -70,12 +70,12 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
 
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
+        # D2H and H2D operate on different tensors, so they can be submitted
+        # to the same stream without an intermediate synchronize.
         # cuda to cpu
         for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
             cuda_data_view.record_stream(stream)
             module_to_cpu.weight.data = cuda_data_view.data.to("cpu", non_blocking=True)
-
-        stream.synchronize()
 
         # cpu to cuda
         for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
@@ -83,7 +83,7 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
             module_to_cuda.weight.data = cuda_data_view
 
     stream.synchronize()
-    torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
+    torch.cuda.current_stream().wait_stream(stream)  # prevents illegal loss value without full sync
 
 
 def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
@@ -270,6 +270,13 @@ class ModelOffloader(Offloader):
         for b in self.blocks[self.num_blocks - self.blocks_to_swap :]:
             b.to(self.device)  # move block to device first
             weights_to_device(b, torch.device('cpu'))  # make sure weights are on cpu
+            # Pin CPU weights for faster non-blocking H2D/D2H transfer.
+            # non_blocking=True only works with pinned memory; without it,
+            # the async swap in ThreadPoolExecutor degrades to synchronous.
+            for name, module in b.named_modules():
+                if 'lora' not in name and hasattr(module, 'weight') and module.weight is not None:
+                    if not module.weight.data.is_pinned():
+                        module.weight.data = module.weight.data.pin_memory()
 
         synchronize_device(self.device)
         clean_memory_on_device(self.device)

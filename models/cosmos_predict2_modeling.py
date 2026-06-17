@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import math
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -269,6 +269,10 @@ class RMSNorm(torch.nn.Module):
         # `output * self.weight` mul into fp32 — not worth the autocast push/pop on every
         # q/k norm (4 per block × 28 blocks). Drop the decorator and let the outer autocast
         # dtype (bf16 in training) govern the final mul.
+        # Use F.rms_norm (single fused kernel) when available (PyTorch >= 2.4),
+        # otherwise fall back to the manual implementation.
+        if hasattr(F, 'rms_norm'):
+            return F.rms_norm(x, self.weight.shape, self.weight, self.eps)
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
@@ -277,7 +281,7 @@ class RMSNorm(torch.nn.Module):
 class GPT2FeedForward(nn.Module):
     def __init__(self, d_model: int, d_ff: int) -> None:
         super().__init__()
-        self.activation = nn.GELU()
+        self.activation = nn.GELU(approximate='tanh')
         self.layer1 = nn.Linear(d_model, d_ff, bias=False)
         self.layer2 = nn.Linear(d_ff, d_model, bias=False)
 
@@ -326,13 +330,16 @@ def torch_attention_op(q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H
     Returns:
         Attention output tensor with shape (batch, seq_len, n_heads * head_dim)
     """
-    in_q_shape = q_B_S_H_D.shape
-    in_k_shape = k_B_S_H_D.shape
-    q_B_H_S_D = rearrange(q_B_S_H_D, "b ... h k -> b h ... k").view(in_q_shape[0], in_q_shape[-2], -1, in_q_shape[-1])
-    k_B_H_S_D = rearrange(k_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
-    v_B_H_S_D = rearrange(v_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
-    result_B_S_HD = rearrange(
-        torch.nn.functional.scaled_dot_product_attention(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D), "b h ... l -> b ... (h l)"
+    # Native ops replace einops rearrange: b s h d -> b h s d -> b s (h d)
+    B = q_B_S_H_D.shape[0]
+    H = q_B_S_H_D.shape[-2]
+    D = q_B_S_H_D.shape[-1]
+    q_B_H_S_D = q_B_S_H_D.transpose(1, 2).reshape(B, H, -1, D)
+    k_B_H_S_D = k_B_S_H_D.transpose(1, 2).reshape(B, H, -1, D)
+    v_B_H_S_D = v_B_S_H_D.transpose(1, 2).reshape(B, H, -1, D)
+    result_B_S_HD = (
+        torch.nn.functional.scaled_dot_product_attention(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D)
+        .transpose(1, 2).reshape(B, -1, H * D)
     )
 
     return result_B_S_HD
@@ -402,9 +409,10 @@ class Attention(nn.Module):
             # state_dict load/save remaps between qkv_proj and the legacy q_proj/k_proj/v_proj keys.
             self.qkv_proj = nn.Linear(query_dim, 3 * inner_dim, bias=False)
         else:
+            # Fused KV: k_proj + v_proj merged into single kv_proj GEMM.
+            # state_dict load/save remaps between kv_proj and legacy k_proj/v_proj keys.
             self.q_proj = nn.Linear(query_dim, inner_dim, bias=False)
-            self.k_proj = nn.Linear(context_dim, inner_dim, bias=False)
-            self.v_proj = nn.Linear(context_dim, inner_dim, bias=False)
+            self.kv_proj = nn.Linear(context_dim, 2 * inner_dim, bias=False)
         self.q_norm = RMSNorm(self.head_dim, eps=1e-6)
         self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
         self.v_norm = nn.Identity()
@@ -439,8 +447,7 @@ class Attention(nn.Module):
             std = 1.0 / math.sqrt(self._query_dim)
             torch.nn.init.trunc_normal_(self.q_proj.weight, std=std, a=-3 * std, b=3 * std)
             std = 1.0 / math.sqrt(self._context_dim)
-            torch.nn.init.trunc_normal_(self.k_proj.weight, std=std, a=-3 * std, b=3 * std)
-            torch.nn.init.trunc_normal_(self.v_proj.weight, std=std, a=-3 * std, b=3 * std)
+            torch.nn.init.trunc_normal_(self.kv_proj.weight, std=std, a=-3 * std, b=3 * std)
 
         std = 1.0 / math.sqrt(self._inner_dim)
         torch.nn.init.trunc_normal_(self.output_proj.weight, std=std, a=-3 * std, b=3 * std)
@@ -461,10 +468,10 @@ class Attention(nn.Module):
         else:
             q = self.q_proj(x)
             context = x if context is None else context
-            k = self.k_proj(context)
-            v = self.v_proj(context)
+            kv = self.kv_proj(context)
+            k, v = kv.chunk(2, dim=-1)
         q, k, v = map(
-            lambda t: rearrange(t, "b ... (h d) -> b ... h d", h=self.n_heads, d=self.head_dim),
+            lambda t: t.reshape(*t.shape[:-1], self.n_heads, self.head_dim),
             (q, k, v),
         )
         q = self.q_norm(q)
@@ -1070,107 +1077,63 @@ class Block(nn.Module):
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
         # Fused AdaLN: one (or two) GEMM(s) produce all 9 modulation vectors at once.
-        # Output is 9*D, reshaped to (3, 3, B, T, D): [branch][shift/scale/gate].
-        # adaln_lora_B_T_3D is broadcast-added to each branch's 3D segment.
+        # Output is 9*D, chunked into 3 branches × (shift, scale, gate).
+        # Native ops replace einops rearrange for lower Python overhead.
+        B, T, H, W, D = x_B_T_H_W_D.shape
         silu_emb = F.silu(emb_B_T_D)
         if self.use_adaln_lora:
             mod_9D = self.adaln_modulation_2(self.adaln_modulation_1(silu_emb))
-            # (B, T, 9D) -> (3, 3, B, T, D): branch=0..2 (self/cross/mlp), ssg=0..2 (shift/scale/gate)
-            mod_3_3_B_T_D = mod_9D.reshape(mod_9D.shape[0], mod_9D.shape[1], 3, 3, -1).permute(2, 3, 0, 1, 4)
-            # adaln_lora_B_T_3D is (B,T,3D); reshape to (1,3,B,T,D) so it broadcasts across
-            # the 3 branches (dim 0) and matches the (shift,scale,gate) split (dim 1).
-            adaln_lora_1_3_B_T_D = adaln_lora_B_T_3D.reshape(*adaln_lora_B_T_3D.shape[:2], 3, -1).permute(2, 0, 1, 3).unsqueeze(0)
-            mod_3_3_B_T_D = mod_3_3_B_T_D + adaln_lora_1_3_B_T_D
+            # chunk(3) → 3 branches, each (B,T,3D); then chunk(3) → shift/scale/gate
+            br_self, br_cross, br_mlp = mod_9D.chunk(3, dim=-1)
+            # adaln_lora: (B,T,3D) → 3 × (B,T,D), added to shift/scale/gate of each branch
+            assert adaln_lora_B_T_3D is not None
+            lora_shift, lora_scale, lora_gate = adaln_lora_B_T_3D.chunk(3, dim=-1)
+            shift_self, scale_self, gate_self = br_self.chunk(3, dim=-1)
+            shift_self = shift_self + lora_shift; scale_self = scale_self + lora_scale; gate_self = gate_self + lora_gate
+            shift_cross, scale_cross, gate_cross = br_cross.chunk(3, dim=-1)
+            shift_cross = shift_cross + lora_shift; scale_cross = scale_cross + lora_scale; gate_cross = gate_cross + lora_gate
+            shift_mlp, scale_mlp, gate_mlp = br_mlp.chunk(3, dim=-1)
+            shift_mlp = shift_mlp + lora_shift; scale_mlp = scale_mlp + lora_scale; gate_mlp = gate_mlp + lora_gate
         else:
             mod_9D = self.adaln_modulation(silu_emb)
-            mod_3_3_B_T_D = mod_9D.reshape(mod_9D.shape[0], mod_9D.shape[1], 3, 3, -1).permute(2, 3, 0, 1, 4)
+            br_self, br_cross, br_mlp = mod_9D.chunk(3, dim=-1)
+            shift_self, scale_self, gate_self = br_self.chunk(3, dim=-1)
+            shift_cross, scale_cross, gate_cross = br_cross.chunk(3, dim=-1)
+            shift_mlp, scale_mlp, gate_mlp = br_mlp.chunk(3, dim=-1)
 
-        shift_self_attn_B_T_D = mod_3_3_B_T_D[0, 0]
-        scale_self_attn_B_T_D = mod_3_3_B_T_D[0, 1]
-        gate_self_attn_B_T_D = mod_3_3_B_T_D[0, 2]
-        shift_cross_attn_B_T_D = mod_3_3_B_T_D[1, 0]
-        scale_cross_attn_B_T_D = mod_3_3_B_T_D[1, 1]
-        gate_cross_attn_B_T_D = mod_3_3_B_T_D[1, 2]
-        shift_mlp_B_T_D = mod_3_3_B_T_D[2, 0]
-        scale_mlp_B_T_D = mod_3_3_B_T_D[2, 1]
-        gate_mlp_B_T_D = mod_3_3_B_T_D[2, 2]
+        # unsqueeze to (B,T,1,1,D) for spatial broadcasting — native ops, no einops
+        shift_self_attn = shift_self.unsqueeze(2).unsqueeze(3)
+        scale_self_attn = scale_self.unsqueeze(2).unsqueeze(3)
+        gate_self_attn = gate_self.unsqueeze(2).unsqueeze(3)
+        shift_cross_attn = shift_cross.unsqueeze(2).unsqueeze(3)
+        scale_cross_attn = scale_cross.unsqueeze(2).unsqueeze(3)
+        gate_cross_attn = gate_cross.unsqueeze(2).unsqueeze(3)
+        shift_mlp = shift_mlp.unsqueeze(2).unsqueeze(3)
+        scale_mlp = scale_mlp.unsqueeze(2).unsqueeze(3)
+        gate_mlp = gate_mlp.unsqueeze(2).unsqueeze(3)
 
-        # Reshape tensors from (B, T, D) to (B, T, 1, 1, D) for broadcasting
-        shift_self_attn_B_T_1_1_D = rearrange(shift_self_attn_B_T_D, "b t d -> b t 1 1 d")
-        scale_self_attn_B_T_1_1_D = rearrange(scale_self_attn_B_T_D, "b t d -> b t 1 1 d")
-        gate_self_attn_B_T_1_1_D = rearrange(gate_self_attn_B_T_D, "b t d -> b t 1 1 d")
+        # Self-attention: norm → modulate → flatten spatial → attn → unflatten
+        normalized_x = self.layer_norm_self_attn(x_B_T_H_W_D) * (1 + scale_self_attn) + shift_self_attn
+        result_B_T_H_W_D = self.self_attn(
+            normalized_x.reshape(B, T * H * W, D),
+            None,
+            rope_emb=rope_emb_L_1_1_D,
+        ).reshape(B, T, H, W, D)
+        x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn * result_B_T_H_W_D
 
-        shift_cross_attn_B_T_1_1_D = rearrange(shift_cross_attn_B_T_D, "b t d -> b t 1 1 d")
-        scale_cross_attn_B_T_1_1_D = rearrange(scale_cross_attn_B_T_D, "b t d -> b t 1 1 d")
-        gate_cross_attn_B_T_1_1_D = rearrange(gate_cross_attn_B_T_D, "b t d -> b t 1 1 d")
+        # Cross-attention: norm → modulate → flatten spatial → attn → unflatten
+        normalized_x = self.layer_norm_cross_attn(x_B_T_H_W_D) * (1 + scale_cross_attn) + shift_cross_attn
+        result_B_T_H_W_D = self.cross_attn(
+            normalized_x.reshape(B, T * H * W, D),
+            crossattn_emb,
+            rope_emb=rope_emb_L_1_1_D,
+        ).reshape(B, T, H, W, D)
+        x_B_T_H_W_D = result_B_T_H_W_D * gate_cross_attn + x_B_T_H_W_D
 
-        shift_mlp_B_T_1_1_D = rearrange(shift_mlp_B_T_D, "b t d -> b t 1 1 d")
-        scale_mlp_B_T_1_1_D = rearrange(scale_mlp_B_T_D, "b t d -> b t 1 1 d")
-        gate_mlp_B_T_1_1_D = rearrange(gate_mlp_B_T_D, "b t d -> b t 1 1 d")
-
-        B, T, H, W, D = x_B_T_H_W_D.shape
-
-        def _fn(_x_B_T_H_W_D, _norm_layer, _scale_B_T_1_1_D, _shift_B_T_1_1_D):
-            return _norm_layer(_x_B_T_H_W_D) * (1 + _scale_B_T_1_1_D) + _shift_B_T_1_1_D
-
-        normalized_x_B_T_H_W_D = _fn(
-            x_B_T_H_W_D,
-            self.layer_norm_self_attn,
-            scale_self_attn_B_T_1_1_D,
-            shift_self_attn_B_T_1_1_D,
-        )
-        result_B_T_H_W_D = rearrange(
-            self.self_attn(
-                # normalized_x_B_T_HW_D,
-                rearrange(normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
-                None,
-                rope_emb=rope_emb_L_1_1_D,
-            ),
-            "b (t h w) d -> b t h w d",
-            t=T,
-            h=H,
-            w=W,
-        )
-        x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn_B_T_1_1_D * result_B_T_H_W_D
-
-        def _x_fn(
-            _x_B_T_H_W_D: torch.Tensor,
-            layer_norm_cross_attn: Callable,
-            _scale_cross_attn_B_T_1_1_D: torch.Tensor,
-            _shift_cross_attn_B_T_1_1_D: torch.Tensor,
-        ) -> torch.Tensor:
-            _normalized_x_B_T_H_W_D = _fn(
-                _x_B_T_H_W_D, layer_norm_cross_attn, _scale_cross_attn_B_T_1_1_D, _shift_cross_attn_B_T_1_1_D
-            )
-            _result_B_T_H_W_D = rearrange(
-                self.cross_attn(
-                    rearrange(_normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
-                    crossattn_emb,
-                    rope_emb=rope_emb_L_1_1_D,
-                ),
-                "b (t h w) d -> b t h w d",
-                t=T,
-                h=H,
-                w=W,
-            )
-            return _result_B_T_H_W_D
-
-        result_B_T_H_W_D = _x_fn(
-            x_B_T_H_W_D,
-            self.layer_norm_cross_attn,
-            scale_cross_attn_B_T_1_1_D,
-            shift_cross_attn_B_T_1_1_D,
-        )
-        x_B_T_H_W_D = result_B_T_H_W_D * gate_cross_attn_B_T_1_1_D + x_B_T_H_W_D
-
-        normalized_x_B_T_H_W_D = _fn(
-            x_B_T_H_W_D,
-            self.layer_norm_mlp,
-            scale_mlp_B_T_1_1_D,
-            shift_mlp_B_T_1_1_D,
-        )
-        result_B_T_H_W_D = self.mlp(normalized_x_B_T_H_W_D)
-        x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result_B_T_H_W_D
+        # MLP: norm → modulate → mlp
+        normalized_x = self.layer_norm_mlp(x_B_T_H_W_D) * (1 + scale_mlp) + shift_mlp
+        result_B_T_H_W_D = self.mlp(normalized_x)
+        x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp * result_B_T_H_W_D
         return x_B_T_H_W_D
 
 

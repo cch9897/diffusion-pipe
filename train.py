@@ -1,5 +1,6 @@
 import argparse
 import os
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True,garbage_collection_threshold:0.6')
 import wandb
 from datetime import datetime, timezone
 import shutil
@@ -16,6 +17,8 @@ import deepspeed
 from deepspeed import comm as dist
 from deepspeed.runtime.pipe import module as ds_pipe_module
 import torch
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -657,6 +660,7 @@ if __name__ == '__main__':
             # when Deepspeed tries to build the fused Adam extension.
             # klass = deepspeed.ops.adam.FusedAdam
             klass = torch.optim.AdamW
+            kwargs.setdefault('fused', True)
         elif optim_type_lower == 'adamw8bit':
             import bitsandbytes
             klass = bitsandbytes.optim.AdamW8bit
@@ -906,6 +910,9 @@ if __name__ == '__main__':
         epoch_loss += loss
         num_steps += 1
         train_dataloader.sync_epoch()
+
+        if step % 50 == 0:
+            empty_cuda_cache()
 
         new_epoch, checkpointed, saved = saver.process_epoch(epoch, step, examples)
         finished_epoch = True if new_epoch != epoch else False

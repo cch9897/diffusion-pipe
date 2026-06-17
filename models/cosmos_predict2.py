@@ -70,6 +70,22 @@ def _remap_state_dict_keys(state_dict):
         new_sd[qkv_key] = torch.cat([q_w, k_w, v_w], dim=0)
         skip_keys.update({f'{prefix}.q_proj.weight', f'{prefix}.k_proj.weight', f'{prefix}.v_proj.weight'})
 
+    # --- Cross-attn KV fusion ---
+    # Find all blocks.N.cross_attn.k_proj.weight and merge with v_proj
+    kv_pattern_re = re.compile(r'^(.+\.cross_attn)\.k_proj\.weight$')
+    for k in list(state_dict.keys()):
+        m = kv_pattern_re.match(k)
+        if not m:
+            continue
+        prefix = m.group(1)
+        kv_key = f'{prefix}.kv_proj.weight'
+        if kv_key in state_dict:
+            continue
+        k_w = state_dict[f'{prefix}.k_proj.weight']
+        v_w = state_dict[f'{prefix}.v_proj.weight']
+        new_sd[kv_key] = torch.cat([k_w, v_w], dim=0)
+        skip_keys.update({f'{prefix}.k_proj.weight', f'{prefix}.v_proj.weight'})
+
     # --- AdaLN fusion ---
     adaln_branches = ['self_attn', 'cross_attn', 'mlp']
     adaln_pattern_re = re.compile(r'^(.+)\.adaln_modulation_self_attn\.1\.weight$')
@@ -138,6 +154,19 @@ def _split_state_dict_keys(state_dict):
         new_sd[f'{prefix}.q_proj.weight'] = qkv_w[:inner_dim]
         new_sd[f'{prefix}.k_proj.weight'] = qkv_w[inner_dim:2*inner_dim]
         new_sd[f'{prefix}.v_proj.weight'] = qkv_w[2*inner_dim:]
+        skip_keys.add(k)
+
+    # --- Cross-attn KV split ---
+    kv_pattern_re = re.compile(r'^(.+\.cross_attn)\.kv_proj\.weight$')
+    for k in list(state_dict.keys()):
+        m = kv_pattern_re.match(k)
+        if not m:
+            continue
+        prefix = m.group(1)
+        kv_w = state_dict[k]
+        inner_dim = kv_w.shape[0] // 2
+        new_sd[f'{prefix}.k_proj.weight'] = kv_w[:inner_dim]
+        new_sd[f'{prefix}.v_proj.weight'] = kv_w[inner_dim:]
         skip_keys.add(k)
 
     # --- AdaLN split ---
@@ -229,6 +258,32 @@ def _remap_lora_keys(state_dict):
             new_sd[fused_key] = torch.cat([q_w, k_w, v_w], dim=0)
         skip_keys.update({q_key, k_key, v_key})
 
+    # --- Cross-attn KV LoRA remap ---
+    kv_lora_re = re.compile(r'^(.+\.cross_attn)\.k_proj\.(lora_[AB])' + _SUFFIX)
+    for k in list(state_dict.keys()):
+        m = kv_lora_re.match(k)
+        if not m:
+            continue
+        prefix = m.group(1)
+        lora_type = m.group(2)
+        adapter_name = m.group(3)
+        mid = f'.{adapter_name}' if adapter_name else ''
+        fused_key = f'{prefix}.kv_proj.{lora_type}{mid}.weight'
+        if fused_key in state_dict or fused_key in new_sd:
+            continue
+        k_key = f'{prefix}.k_proj.{lora_type}{mid}.weight'
+        v_key = f'{prefix}.v_proj.{lora_type}{mid}.weight'
+        if not all(kk in state_dict for kk in [k_key, v_key]):
+            continue
+        k_w, v_w = state_dict[k_key], state_dict[v_key]
+        if lora_type == 'lora_A':
+            # Old: 2 × (R, D). New: (R, D). Average.
+            new_sd[fused_key] = (k_w + v_w) / 2.0
+        else:
+            # lora_B: Old 2 × (D, R). New: (2D, R). Cat along dim 0.
+            new_sd[fused_key] = torch.cat([k_w, v_w], dim=0)
+        skip_keys.update({k_key, v_key})
+
     # --- AdaLN LoRA remap ---
     adaln_branches = ['self_attn', 'cross_attn', 'mlp']
     adaln_lora_re = re.compile(r'^(.+)\.adaln_modulation_self_attn\.1\.(lora_[AB])' + _SUFFIX)
@@ -303,6 +358,28 @@ def _split_lora_keys(state_dict):
             out_dim = qkv_w.shape[0] // 3
             for i, proj in enumerate(['q_proj', 'k_proj', 'v_proj']):
                 new_sd[f'{prefix}.{proj}.{lora_type}{mid}.weight'] = qkv_w[i*out_dim:(i+1)*out_dim]
+        skip_keys.add(k)
+
+    # --- Cross-attn KV LoRA split ---
+    kv_lora_re = re.compile(r'^(.+\.cross_attn)\.kv_proj\.(lora_[AB])' + _SUFFIX)
+    for k in list(state_dict.keys()):
+        m = kv_lora_re.match(k)
+        if not m:
+            continue
+        prefix = m.group(1)
+        lora_type = m.group(2)
+        adapter_name = m.group(3)
+        mid = f'.{adapter_name}' if adapter_name else ''
+        kv_w = state_dict[k]
+        if lora_type == 'lora_A':
+            # (R, D) -> replicate to 2 × (R, D)
+            for proj in ['k_proj', 'v_proj']:
+                new_sd[f'{prefix}.{proj}.{lora_type}{mid}.weight'] = kv_w.clone()
+        else:
+            # (2D, R) -> 2 × (D, R)
+            out_dim = kv_w.shape[0] // 2
+            for i, proj in enumerate(['k_proj', 'v_proj']):
+                new_sd[f'{prefix}.{proj}.{lora_type}{mid}.weight'] = kv_w[i*out_dim:(i+1)*out_dim]
         skip_keys.add(k)
 
     # --- AdaLN LoRA split ---
@@ -945,7 +1022,9 @@ class LLMAdapterLayer(nn.Module):
             )
             crossattn_emb[~t5_attn_mask.bool()] = 0
 
-        return make_contiguous(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
+        # Only crossattn_emb changed; x and other tensors are unchanged.
+        crossattn_emb = crossattn_emb.contiguous()
+        return (x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
 
 
 class TransformerLayer(nn.Module):
@@ -963,7 +1042,9 @@ class TransformerLayer(nn.Module):
         x_B_T_H_W_D = self.block(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, rope_emb_L_1_1_D=rope_emb_L_1_1_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
+        # Only x needs contiguous — the other 5 tensors are unchanged between blocks.
+        x_B_T_H_W_D = x_B_T_H_W_D.contiguous()
+        return (x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
 
 
 class FinalLayer(nn.Module):
