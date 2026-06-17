@@ -306,18 +306,20 @@ class Automagic(torch.optim.Optimizer):
                     weight_decay_update = None
 
                 if p.dtype == torch.bfloat16:
-                    # Kahan compensated summation for bfloat16 (Neumaier variant)
-                    # Note: update has already been negated by update.mul_(-1) above
+                    # In-place fused Kahan compensated summation for bfloat16.
+                    # Zero temporary allocations — arithmetic is hidden by memory bandwidth.
+                    # Uses the opposite-sign convention (shift holds -compensation).
+                    # Negate update to the descent direction, matching the fp32 path's
+                    # p_data_fp32.add_(-update) below.
                     update.mul_(-1)
                     if weight_decay_update is not None:
                         update.add_(weight_decay_update)
-                    # Neumaier: y = update - compensation; t = p + y; compensation = (t - p) - y; p = t
                     shift = state['shift']
-                    y = update - shift
-                    t = p.detach() + y
-                    new_shift = (t - p.detach()) - y
-                    p.copy_(t)
-                    shift.copy_(new_shift)
+                    shift.add_(update)                 # shift = comp + update
+                    # Reuse 'update' as temp buffer (already consumed by shift.add_ above)
+                    update.copy_(p.detach())           # update = p_old
+                    p.add_(shift)                      # bf16-rounded addition
+                    shift.add_(update.sub_(p))         # recover rounding error: comp = -(rounding error)
                 else:
                     if weight_decay_update is not None:
                         p_data_fp32.add_(weight_decay_update)

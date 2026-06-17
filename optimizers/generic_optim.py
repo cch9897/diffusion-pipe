@@ -483,16 +483,17 @@ class GenericOptim(Optimizer):
                 synchronize |= using_cpu_offload
 
                 if p.dtype == torch.bfloat16:
-                    # Kahan compensated summation for bfloat16 (Neumaier variant)
+                    # In-place fused Kahan compensated summation for bfloat16.
+                    # Zero temporary allocations — arithmetic is hidden by memory bandwidth.
+                    # Uses the opposite-sign convention (shift holds -compensation),
+                    # bit-identical to Neumaier but without the 3-temp-tensor overhead.
                     if 'shift' not in state:
                         state['shift'] = torch.zeros_like(p)
                     shift = state['shift'].to(p.device, non_blocking=True)
-                    # Neumaier: y = update - compensation; t = p + y; compensation = (t - p) - y; p = t
-                    y = update - shift
-                    t = p.detach() + y
-                    new_shift = (t - p.detach()) - y
-                    p.copy_(t)
-                    shift.copy_(new_shift)
+                    shift.add_(update)                 # shift = comp + update
+                    p.grad.copy_(p.detach())           # reuse p.grad as temp buffer (grad already consumed)
+                    p.add_(shift)                      # bf16-rounded addition
+                    shift.add_(p.grad.sub_(p))         # recover rounding error: comp = -(rounding error)
                     # TODO: non_blocking=True here causes CUDA error on first step after checkpoint save.
                     state['shift'] = shift.to(kahan_buffer_device)
                 else:
