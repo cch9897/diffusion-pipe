@@ -2,7 +2,7 @@ import sqlite3
 from pathlib import Path
 import os
 import io
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 import torch
 
@@ -26,7 +26,12 @@ class Cache:
         assert isinstance(idx, int)
         shard_id, shard_index = self.items[idx]
         offset, size = self.shard_metadata[shard_id][shard_index]
-        if shard_id not in self.open_files:
+        if shard_id in self.open_files:
+            self.open_files.move_to_end(shard_id)
+        else:
+            if len(self.open_files) >= 64:
+                _, old_f = self.open_files.popitem(last=False)
+                old_f.close()
             self.open_files[shard_id] = open(self.path / f'shard_{shard_id}.bin', 'rb')
         f = self.open_files[shard_id]
         f.seek(offset)
@@ -62,7 +67,18 @@ class Cache:
             self.con.execute('INSERT INTO fingerprint VALUES(?)', (self.fingerprint,))
 
         # items table, current length, next shard index
-        self.con.execute('CREATE TABLE IF NOT EXISTS items(shard, shard_index)')
+        self.con.execute('CREATE TABLE IF NOT EXISTS items(shard INT, shard_index INT, PRIMARY KEY(shard, shard_index))')
+
+        # migration: detect old table without primary key and rebuild
+        cols = self.con.execute('PRAGMA table_info(items)').fetchall()
+        has_pk = any(col[5] for col in cols)  # col[5] = pk flag
+        if cols and not has_pk:
+            print('[CACHE] Migrating items table to add primary key')
+            self.con.execute('ALTER TABLE items RENAME TO items_old')
+            self.con.execute('CREATE TABLE items(shard INT, shard_index INT, PRIMARY KEY(shard, shard_index))')
+            self.con.execute('INSERT OR IGNORE INTO items SELECT * FROM items_old')
+            self.con.execute('DROP TABLE items_old')
+            self.con.commit()
         self.items = self.con.execute('SELECT shard, shard_index FROM items').fetchall() or []
         max_existing_shard = -1
         for shard, _ in self.items:
@@ -78,7 +94,8 @@ class Cache:
                 shard_id = int(table_name.split('_')[-1])
                 for entry in self.con.execute(f'SELECT offset, size FROM {table_name}').fetchall():
                     self.shard_metadata[shard_id].append(entry)
-        self.open_files = {}
+        # LRU-ordered dict caps open file handles at 64, evicting least recently used
+        self.open_files = OrderedDict()
 
         # commit
         self.con.commit()
@@ -87,9 +104,20 @@ class Cache:
     def clear(self):
         '''Deletes all cache files from disk. Calls init() again.'''
         self.con.close()
-        os.remove(self.metadata_db)
+        # Phase 1: delete database first. If this fails, abort — bin files are
+        # left behind for manual cleanup rather than risking an inconsistent state.
+        try:
+            os.remove(self.metadata_db)
+        except OSError as e:
+            print(f'[CACHE] FATAL: could not remove database {self.metadata_db}: {e}')
+            raise
+        # Phase 2: delete bin files individually. Partial failures are warned
+        # but do not abort — leftover bin files are harmless.
         for bin_path in self.path.glob('*.bin'):
-            os.remove(bin_path)
+            try:
+                os.remove(bin_path)
+            except OSError as e:
+                print(f'[CACHE] Warning: could not remove {bin_path}: {e}')
         self.init()
 
 
@@ -127,6 +155,11 @@ class Cache:
         After fork(), the inherited SQLite connection and file handles are shared
         across worker processes, which can cause lock contention or seek races.
         Call this from worker_init_fn to get a private read-only connection.
+
+        Called from _worker_init_fn after DataLoader fork. Each worker gets
+        its own copy of the Cache object (copy-on-write), so there is no
+        cross-worker contention on self.con. Read-only URI mode avoids
+        SQLite write lock contention entirely.
         """
         self.con.close()
         self.con = sqlite3.connect(

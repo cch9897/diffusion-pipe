@@ -277,7 +277,12 @@ def _remap_lora_keys(state_dict):
             continue
         k_w, v_w = state_dict[k_key], state_dict[v_key]
         if lora_type == 'lora_A':
-            # Old: 2 × (R, D). New: (R, D). Average.
+            # Old: 2 × (R, D). New: (R, D). Average (lossy — 2R → R).
+            import warnings
+            warnings.warn(
+                f'Remapping legacy KV LoRA: averaging 2 lora_A tensors for {prefix}. '
+                f'This is lossy (rank 2R → R). Consider retraining with fused kv_proj.'
+            )
             new_sd[fused_key] = (k_w + v_w) / 2.0
         else:
             # lora_B: Old 2 × (D, R). New: (2D, R). Cat along dim 0.
@@ -305,9 +310,14 @@ def _remap_lora_keys(state_dict):
             l1_list = [state_dict[kk] for kk in layer1_keys]
             l2_list = [state_dict[kk] for kk in layer2_keys]
             if lora_type == 'lora_A':
-                # Old layer1: 3 × (R, D). New: (R, D). Average.
+                # Old layer1: 3 × (R, D). New: (R, D). Average (lossy — 3R → R).
+                # Old layer2: 3 × (R, adaln_lora_dim). New: (R, adaln_lora_dim). Average (lossy).
+                import warnings
+                warnings.warn(
+                    f'Remapping legacy AdaLN LoRA: averaging 3 lora_A tensors for {prefix}. '
+                    f'This is lossy (rank 3R → R). Consider retraining with fused adaln_modulation.'
+                )
                 new_sd[fused_key_1] = sum(l1_list) / 3.0
-                # Old layer2: 3 × (R, adaln_lora_dim). New: (R, adaln_lora_dim). Average.
                 new_sd[fused_key_2] = sum(l2_list) / 3.0
             else:
                 # lora_B

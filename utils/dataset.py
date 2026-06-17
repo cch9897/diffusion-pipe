@@ -156,6 +156,7 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
             cache.add(example)
 
     pool.close()
+    pool.join()
     cache.finalize_current_shard()
     return cache
 
@@ -735,7 +736,9 @@ class DirectoryDataset:
         directory_config.setdefault('shuffle_metadata', dataset_config.get('shuffle_metadata', True))
 
     def _metadata_map_fn(self):
-        tarfile_map = {}
+        from collections import OrderedDict
+        tarfile_map = OrderedDict()
+        MAX_OPEN_TARS = 32
 
         def fn(example):
             empty_return = {'image_spec': [], 'mask_file': [], 'caption': [], 'ar_bucket': [], 'size_bucket': [], 'is_video': []}
@@ -768,6 +771,11 @@ class DirectoryDataset:
                 filepath_or_file = str(image_file)
             else:
                 tar_filename = image_spec[0]
+                if tar_filename in tarfile_map:
+                    tarfile_map.move_to_end(tar_filename)
+                elif len(tarfile_map) >= MAX_OPEN_TARS:
+                    _, old_tar = tarfile_map.popitem(last=False)
+                    old_tar.close()
                 if tar_filename not in tarfile_map:
                     tarfile_map[tar_filename] = tarfile.TarFile(tar_filename)
                 tar_f = tarfile_map[tar_filename]
