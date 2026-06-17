@@ -53,6 +53,7 @@ parser.add_argument('--trust_cache', action='store_true', help='Load from metada
 parser.add_argument('--i_know_what_i_am_doing', action='store_true', help="Skip certain checks and overrides. You may end up using settings that won't work.")
 parser.add_argument('--master_port', type=int, default=29500, help='Master port for distributed training')
 parser.add_argument('--dump_dataset', type=Path, default=None, help='Decode cached latents and dump the dataset to this directory.')
+parser.add_argument('--test_sample', action='store_true', help='Generate and write an image to example.png and then quit.')
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
@@ -114,15 +115,20 @@ def set_config_defaults(config):
     if 'adapter' in config:
         adapter_config = config['adapter']
         adapter_type = adapter_config['type']
+        if 'alpha' in adapter_config:
+            raise NotImplementedError(
+                'This script forces alpha=rank to make the saved adapter format simpler and more predictable with downstream inference programs. Please remove alpha from the config.'
+            )
+        adapter_config['alpha'] = adapter_config['rank']
+        adapter_config.setdefault('dtype', model_dtype_str)
+        adapter_config['dtype'] = DTYPE_MAP[adapter_config['dtype']]
+
+        # per-adapter defaults
         if adapter_config['type'] == 'lora':
-            if 'alpha' in adapter_config:
-                raise NotImplementedError(
-                    'This script forces alpha=rank to make the saved LoRA format simpler and more predictable with downstream inference programs. Please remove alpha from the config.'
-                )
-            adapter_config['alpha'] = adapter_config['rank']
             adapter_config.setdefault('dropout', 0.0)
-            adapter_config.setdefault('dtype', model_dtype_str)
-            adapter_config['dtype'] = DTYPE_MAP[adapter_config['dtype']]
+        elif adapter_config['type'] == 'lokr':
+            adapter_config.setdefault('decompose_factor', -1)
+            adapter_config.setdefault('rank_dropout', 0.0)
         else:
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
 
@@ -363,6 +369,9 @@ if __name__ == '__main__':
     elif model_type == 'ltx2':
         from models import ltx2
         model = ltx2.LTX2Pipeline(config)
+    elif model_type == 'ideogram4':
+        from models import ideogram4
+        model = ideogram4.Ideogram4Pipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
@@ -413,7 +422,7 @@ if __name__ == '__main__':
         'steps_per_print': config.get('steps_per_print', 1),
     }
     caching_batch_size = config.get('caching_batch_size', 1)
-    dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size)
+    dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, keep_models_loaded=args.test_sample)
 
     train_data = dataset_util.Dataset(dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
     dataset_manager.register(train_data)
@@ -502,6 +511,9 @@ if __name__ == '__main__':
     if args.cache_only:
         quit()
 
+    if args.test_sample:
+        model.prepare_sample_test('a golden retriever running through a grassy field', cfg=1)
+
     model.load_diffusion_model()
 
     if adapter_config := config.get('adapter', None):
@@ -589,6 +601,7 @@ if __name__ == '__main__':
         loss_fn=model.get_loss_fn(),
         **additional_pipeline_module_kwargs
     )
+    model.pipeline_model = pipeline_model
     parameters_to_train = [p for p in pipeline_model.parameters() if p.requires_grad]
 
     if config['compile']:
@@ -605,6 +618,14 @@ if __name__ == '__main__':
     model_engine._support_torch_style_backward = True
     global_batch_size = model_engine.train_micro_batch_size_per_gpu() * model_engine.gradient_accumulation_steps() * model_engine.grid.get_data_parallel_world_size()
     print(f'Global batch size = {global_batch_size}')
+
+    if args.test_sample:
+        import torchvision
+        img = model.sample(w=512, h=512)
+        img = img.squeeze(0).movedim(-1, 0)
+        print(img.shape, img.min().item(), img.max().item())
+        torchvision.utils.save_image(img, 'example.png')
+        quit()
 
     if save_every_n_examples := config.pop('save_every_n_examples', None):
         config['save_every_n_steps'] = save_every_n_examples // global_batch_size
