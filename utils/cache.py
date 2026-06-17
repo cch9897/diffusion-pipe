@@ -122,6 +122,19 @@ class Cache:
                     while f.read(1024 * 1024):
                         pass
 
+    def init_readonly(self):
+        """Reopen SQLite and file handles in read-only mode for use in DataLoader workers.
+
+        After fork(), the inherited SQLite connection and file handles are shared
+        across worker processes, which can cause lock contention or seek races.
+        Call this from worker_init_fn to get a private read-only connection.
+        """
+        self.con.close()
+        self.con = sqlite3.connect(
+            f'file:{self.metadata_db}?mode=ro', uri=True
+        )
+        self.open_files = {}
+
 
     def add(self, item):
         if self.shard_file is None:

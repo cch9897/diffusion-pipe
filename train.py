@@ -903,9 +903,31 @@ if __name__ == '__main__':
     epoch_loss = 0
     num_steps = 0
     empty_cuda_cache()
+
+    # Cross-step data prefetch: overlap next step's data preparation with current step's GPU compute.
+    from concurrent.futures import ThreadPoolExecutor
+    _prefetch_executor = None
+    if model_engine.is_first_stage() or model_engine.is_last_stage():
+        _prefetch_executor = ThreadPoolExecutor(max_workers=1)
+    _prefetch_future = None
+
+    def _prefetch_next():
+        if _prefetch_executor is None:
+            return None
+        return _prefetch_executor.submit(get_data_iterator_for_step, train_dataloader, model_engine)
+
+    # Kick off the first prefetch
+    _prefetch_future = _prefetch_next()
+
     while True:
         model_engine.reset_activation_shape()
-        iterator = get_data_iterator_for_step(train_dataloader, model_engine)
+        # Wait for the prefetch to complete (should be ready by now since GPU was busy)
+        if _prefetch_future is not None:
+            iterator = _prefetch_future.result()
+        else:
+            iterator = get_data_iterator_for_step(train_dataloader, model_engine)
+        # Start prefetching the next step's data while GPU computes
+        _prefetch_future = _prefetch_next()
         loss = model_engine.train_batch(iterator).item()
         epoch_loss += loss
         num_steps += 1

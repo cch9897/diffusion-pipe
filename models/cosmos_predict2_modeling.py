@@ -653,7 +653,7 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
             dim=-1,
         )
 
-        freqs = rearrange(em_T_H_W_D, "t h w d -> (t h w) 1 1 d").float()
+        freqs = em_T_H_W_D.reshape(-1, 1, 1, em_T_H_W_D.shape[-1]).float()
         # Precompute cos/sin once so the trig isn't recomputed inside every self-attention.
         # Stack as [2, L, 1, 1, D] — index 0 is cos, index 1 is sin. The rotary apply path
         # detects this rank-5 shape and skips the cos/sin computation.
@@ -737,7 +737,9 @@ class Timesteps(nn.Module):
         cos_emb = torch.cos(emb)
         emb = torch.cat([cos_emb, sin_emb], dim=-1)
 
-        return rearrange(emb.to(dtype=in_dype), "(b t) d -> b t d", b=timesteps_B_T.shape[0], t=timesteps_B_T.shape[1])
+        b = timesteps_B_T.shape[0]
+        t = timesteps_B_T.shape[1]
+        return emb.to(dtype=in_dype).reshape(b, t, -1)
 
 
 class TimestepEmbedding(nn.Module):
@@ -963,19 +965,11 @@ class FinalLayer(nn.Module):
         else:
             shift_B_T_D, scale_B_T_D = self.adaln_modulation(emb_B_T_D).chunk(2, dim=-1)
 
-        shift_B_T_1_1_D, scale_B_T_1_1_D = rearrange(shift_B_T_D, "b t d -> b t 1 1 d"), rearrange(
-            scale_B_T_D, "b t d -> b t 1 1 d"
-        )
+        # Native ops replace einops rearrange for lower Python overhead.
+        shift_B_T_1_1_D = shift_B_T_D.unsqueeze(2).unsqueeze(3)
+        scale_B_T_1_1_D = scale_B_T_D.unsqueeze(2).unsqueeze(3)
 
-        def _fn(
-            _x_B_T_H_W_D: torch.Tensor,
-            _norm_layer: nn.Module,
-            _scale_B_T_1_1_D: torch.Tensor,
-            _shift_B_T_1_1_D: torch.Tensor,
-        ) -> torch.Tensor:
-            return _norm_layer(_x_B_T_H_W_D) * (1 + _scale_B_T_1_1_D) + _shift_B_T_1_1_D
-
-        x_B_T_H_W_D = _fn(x_B_T_H_W_D, self.layer_norm, scale_B_T_1_1_D, shift_B_T_1_1_D)
+        x_B_T_H_W_D = self.layer_norm(x_B_T_H_W_D) * (1 + scale_B_T_1_1_D) + shift_B_T_1_1_D
         x_B_T_H_W_O = self.linear(x_B_T_H_W_D)
         return x_B_T_H_W_O
 
@@ -1404,13 +1398,17 @@ class MiniTrainDIT(nn.Module):
         return x_B_T_H_W_D, None, extra_pos_emb
 
     def unpatchify(self, x_B_T_H_W_M: torch.Tensor) -> torch.Tensor:
-        x_B_C_Tt_Hp_Wp = rearrange(
-            x_B_T_H_W_M,
-            "B T H W (p1 p2 t C) -> B C (T t) (H p1) (W p2)",
-            p1=self.patch_spatial,
-            p2=self.patch_spatial,
-            t=self.patch_temporal,
-        )
+        # Native ops replace einops rearrange:
+        # "B T H W (p1 p2 t C) -> B C (T t) (H p1) (W p2)"
+        B, T, H, W, M = x_B_T_H_W_M.shape
+        p1 = self.patch_spatial
+        p2 = self.patch_spatial
+        t = self.patch_temporal
+        C = M // (p1 * p2 * t)
+        x = x_B_T_H_W_M.reshape(B, T, H, W, p1, p2, t, C)
+        # B T H W p1 p2 t C -> B C T t H p1 W p2
+        x = x.permute(0, 7, 1, 6, 2, 4, 3, 5)
+        x_B_C_Tt_Hp_Wp = x.reshape(B, C, T * t, H * p1, W * p2)
         return x_B_C_Tt_Hp_Wp
 
     def forward(

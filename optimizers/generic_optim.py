@@ -498,8 +498,12 @@ class GenericOptim(Optimizer):
                     p.add_(update)
 
         if synchronize:
-            # Because we did non_blocking transfer in GPU -> CPU direction
-            torch.cuda.synchronize()
+            # Because we did non_blocking transfer in GPU -> CPU direction.
+            # Use an event instead of full synchronize so the next micro-batch's
+            # forward can overlap with the tail of this transfer.
+            self._sync_event = torch.cuda.Event()
+            self._sync_event.record()
+            self._sync_event.synchronize()
 
         if len(skipped_parameter_names) > 0:
             print(f'WARNING: {len(skipped_parameter_names)} parameter updates were skipped due to Inf or NaN.')

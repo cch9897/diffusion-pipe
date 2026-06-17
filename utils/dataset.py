@@ -1210,6 +1210,18 @@ class DatasetManager:
         if is_main_process():
             process.join()
 
+        # Pre-read all shard files into OS page cache for faster first-epoch reads.
+        if is_main_process():
+            for ds in self.datasets:
+                for dds in ds.directory_datasets:
+                    for sbd in dds.get_size_bucket_datasets():
+                        if hasattr(sbd, 'latent_dataset') and hasattr(sbd.latent_dataset, 'warmup'):
+                            sbd.latent_dataset.warmup()
+                        for te_ds in getattr(sbd, 'text_embedding_datasets', []):
+                            inner = getattr(te_ds, 'te_dataset', te_ds)
+                            if hasattr(inner, 'warmup'):
+                                inner.warmup()
+
         # Now load all datasets from cache.
         for ds in self.datasets:
             ds.cache_metadata(trust_cache=True)
@@ -1285,6 +1297,28 @@ def split_batch(batch, pieces):
 #     return examples
 
 
+def _worker_init_fn(worker_id):
+    """Reopen Cache SQLite connections in read-only mode after fork to avoid lock contention."""
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is None:
+        return
+    dataset = worker_info.dataset
+    _reopen_caches_readonly(dataset)
+
+
+def _reopen_caches_readonly(obj):
+    """Recursively find Cache objects and reopen their SQLite connections read-only."""
+    from utils.cache import Cache
+    if isinstance(obj, Cache):
+        obj.init_readonly()
+    elif hasattr(obj, '__dict__'):
+        for v in obj.__dict__.values():
+            _reopen_caches_readonly(v)
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            _reopen_caches_readonly(item)
+
+
 # DataLoader that divides batches into microbatches for gradient accumulation steps when doing
 # pipeline parallel training. Iterates indefinitely (deepspeed requirement). Keeps track of epoch.
 # Updates epoch as soon as the final batch is returned (notably different from qlora-pipe).
@@ -1356,7 +1390,8 @@ class PipelineDataLoader:
             sampler=sampler,
             num_workers=self.num_dataloader_workers,
             persistent_workers=(self.num_dataloader_workers > 0),
-            prefetch_factor=2 if self.num_dataloader_workers > 0 else None,
+            prefetch_factor=4 if self.num_dataloader_workers > 0 else None,
+            worker_init_fn=_worker_init_fn if self.num_dataloader_workers > 0 else None,
         )
 
     def _pull_batches_from_dataloader(self):
