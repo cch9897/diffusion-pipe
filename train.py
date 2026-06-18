@@ -788,7 +788,7 @@ if __name__ == '__main__':
             params_wd = []
             params = pg.pop('params')
             for p in params:
-                if p.ndim == 1 or p.original_name.startswith('llm_adapter.embed'):
+                if p.ndim == 1 or getattr(p, 'original_name', '').startswith('llm_adapter.embed'):
                     params_no_wd.append(p)
                 else:
                     params_wd.append(p)
