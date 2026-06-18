@@ -718,6 +718,9 @@ class CosmosPredict2Pipeline(BasePipeline):
         self.peft_config.save_pretrained(save_dir)
         # Split fused LoRA keys back to legacy layout for ComfyUI compatibility.
         peft_state_dict = _split_lora_keys(peft_state_dict)
+        # Make tensors contiguous — split slices may be non-contiguous views,
+        # which breaks safetensors' tensor.view(-1) in _find_shared_tensors.
+        peft_state_dict = {k: v.contiguous() for k, v in peft_state_dict.items()}
         # ComfyUI format.
         peft_state_dict = {'diffusion_model.'+k: v for k, v in peft_state_dict.items()}
         safetensors.torch.save_file(peft_state_dict, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})
