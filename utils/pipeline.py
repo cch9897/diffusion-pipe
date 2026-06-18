@@ -1,4 +1,5 @@
 from torch import nn
+import torch
 
 from deepspeed.pipe import PipelineModule
 from deepspeed.runtime.pipe import LayerSpec
@@ -14,12 +15,22 @@ class ManualPipelineModule(PipelineModule):
         # Workaround PyTorch 2.12: Module.to() no longer supports meta→device.
         # DeepSpeed PipelineModule.__init__ calls self.to(device) on meta-param layers.
         # Catch the NotImplementedError and retry with to_empty().
+        # Note: to_empty() requires keyword-only 'device', but DeepSpeed passes it
+        # positionally (self.to("cuda:0")). Extract and remap accordingly.
         _original_to = nn.Module.to
         def _to_empty_fallback(module, *to_args, **to_kwargs):
             try:
                 return _original_to(module, *to_args, **to_kwargs)
             except NotImplementedError:
-                return module.to_empty(*to_args, **to_kwargs)
+                # to_empty(device=...) is keyword-only; DeepSpeed calls to() positionally
+                device = to_kwargs.pop('device', None)
+                if device is None and to_args:
+                    arg0 = to_args[0]
+                    if isinstance(arg0, (torch.device, str, int)):
+                        device = arg0
+                    elif hasattr(arg0, 'device'):  # e.g. a tensor
+                        device = arg0.device
+                return module.to_empty(device=device, **to_kwargs)
         nn.Module.to = _to_empty_fallback
         try:
             super().__init__(*args, **kwargs)
