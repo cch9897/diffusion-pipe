@@ -91,11 +91,14 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
             cuda_data_view.copy_(module_to_cuda.weight.data, non_blocking=True)
             module_to_cuda.weight.data = cuda_data_view
 
-    # Record event instead of synchronize() to avoid blocking the calling
-    # thread. The event is stored and waited on in _wait_blocks_move.
+    # Record event on the swap stream. The event is waited on in
+    # _wait_blocks_move via current_stream().wait_event(event), which
+    # inserts a non-blocking GPU dependency *at the point the swapped-in
+    # block is actually needed* (block.forward), not here at submit time.
+    # This preserves compute↔swap overlap: intermediate blocks' compute
+    # runs concurrently with the D2H+H2D transfer on _swap_stream.
     event = torch.cuda.Event()
     event.record(stream)
-    torch.cuda.current_stream().wait_stream(stream)  # prevents illegal loss value without full sync
     return event
 
 
@@ -166,12 +169,12 @@ class Offloader:
         block_to_cpu = self.blocks[block_idx_to_cpu]
         block_to_cuda = self.blocks[block_idx_to_cuda]
 
-        # swap_weight_devices_cuda handles all CUDA synchronization internally:
+        # swap_weight_devices_cuda handles CUDA synchronization internally:
         # - _swap_stream.wait_stream(current_stream) to ensure compute is done
-        #   before reading weights (non-blocking dependency)
-        # - current_stream().wait_stream(_swap_stream) so the main compute
-        #   stream waits for swapped data before using it
-        # Returns a CUDA event for CPU-side synchronization in _wait_blocks_move.
+        #   before D2H reads weights (non-blocking GPU dependency)
+        # - Records an event on _swap_stream and returns it; the compute→swap
+        #   dependency is deferred to _wait_blocks_move (wait_event at the
+        #   point the swapped-in block is needed), preserving overlap.
         event = self.swap_weight_devices(block_to_cpu, block_to_cuda)
         if event is not None:
             self.swap_events[block_idx_to_cuda] = event
@@ -180,16 +183,18 @@ class Offloader:
             print(f"[{self.block_type}] Moved blocks {block_idx_to_cpu} and {block_idx_to_cuda} in {time.perf_counter()-start_time:.2f}s")
 
     def _wait_blocks_move(self, block_idx):
-        # CPU-side sync: ensure D2H to CPU memory is complete before
-        # this block's weights are read for the next H2D or forward pass.
-        # CUDA-side sync is handled by swap_weight_devices_cuda's
-        # current_stream().wait_stream(_swap_stream).
+        # Insert a non-blocking GPU dependency: the compute stream waits for
+        # the swap stream's event *at this point* — i.e., right before the
+        # swapped-in block's weight is read by block.forward. This is the
+        # latest safe point to establish the compute→swap dependency,
+        # maximizing the window where intermediate block compute overlaps
+        # with D2H+H2D on _swap_stream. Does not block the CPU thread.
         if block_idx in self.swap_events:
             if self.debug:
                 print(f"[{self.block_type}] Wait for block {block_idx}")
                 start_time = time.perf_counter()
             event = self.swap_events.pop(block_idx)
-            event.synchronize()
+            torch.cuda.current_stream().wait_event(event)
             if self.debug:
                 print(f"[{self.block_type}] Waited for block {block_idx}: {time.perf_counter()-start_time:.2f}s")
 
