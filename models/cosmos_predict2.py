@@ -311,14 +311,23 @@ def _remap_lora_keys(state_dict):
             l2_list = [state_dict[kk] for kk in layer2_keys]
             if lora_type == 'lora_A':
                 # Old layer1: 3 × (R, D). New: (R, D). Average (lossy — 3R → R).
-                # Old layer2: 3 × (R, adaln_lora_dim). New: (R, adaln_lora_dim). Average (lossy).
+                # Old layer2: 3 × (R, adaln_lora_dim). New: (R, 3*adaln_lora_dim). Cat dim 1 (non-lossy).
                 import warnings
+                adaln_lora_dim = l2_list[0].shape[1]
+                if adaln_lora_dim % 3 != 0:
+                    warnings.warn(
+                        f'Remapping legacy AdaLN LoRA for {prefix}: '
+                        f'adaln_lora_dim={adaln_lora_dim} not divisible by 3. '
+                        f'Layer-2 lora_A cat may produce unexpected shapes.'
+                    )
                 warnings.warn(
-                    f'Remapping legacy AdaLN LoRA: averaging 3 lora_A tensors for {prefix}. '
-                    f'This is lossy (rank 3R → R). Consider retraining with fused adaln_modulation.'
+                    f'Remapping legacy AdaLN LoRA for {prefix}: '
+                    f'layer-1 lora_A averaged (lossy, 3R→R); '
+                    f'layer-2 lora_A concatenated dim 1 (non-lossy). '
+                    f'Consider retraining with fused adaln_modulation for full fidelity.'
                 )
                 new_sd[fused_key_1] = sum(l1_list) / 3.0
-                new_sd[fused_key_2] = sum(l2_list) / 3.0
+                new_sd[fused_key_2] = torch.cat(l2_list, dim=1)
             else:
                 # lora_B
                 # Old layer1: 3 × (adaln_lora_dim, R). New: (3*adaln_lora_dim, R). Cat dim 0.
@@ -408,11 +417,12 @@ def _split_lora_keys(state_dict):
         if mod2_w is None:
             continue
         if lora_type == 'lora_A':
-            # mod1: (R, D) -> replicate to 3 × (R, D)
-            # mod2: (R, adaln_lora_dim) -> replicate to 3 × (R, adaln_lora_dim)
-            for b in adaln_branches:
+            # mod1: (R, D) -> replicate to 3 × (R, D)  (was averaged, all branches identical)
+            # mod2: (R, 3*adaln_lora_dim) -> slice dim 1 to 3 × (R, adaln_lora_dim)
+            ald = mod2_w.shape[1] // 3
+            for i, b in enumerate(adaln_branches):
                 new_sd[f'{prefix}.adaln_modulation_{b}.1.{lora_type}{mid}.weight'] = mod1_w.clone()
-                new_sd[f'{prefix}.adaln_modulation_{b}.2.{lora_type}{mid}.weight'] = mod2_w.clone()
+                new_sd[f'{prefix}.adaln_modulation_{b}.2.{lora_type}{mid}.weight'] = mod2_w[:, i*ald:(i+1)*ald].clone()
         else:
             # lora_B
             # mod1: (3*adaln_lora_dim, R) -> 3 × (adaln_lora_dim, R)

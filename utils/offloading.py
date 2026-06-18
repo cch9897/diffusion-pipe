@@ -10,7 +10,6 @@
 
 import gc
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import torch
@@ -141,8 +140,12 @@ class Offloader:
         self.device = device
         self.debug = debug
 
-        self.thread_pool = ThreadPoolExecutor(max_workers=1)
-        self.futures = {}
+        # CUDA context is thread-local; ThreadPoolExecutor creates threads
+        # that may not have a proper CUDA context, risking stream operations
+        # becoming no-ops. max_workers=1 provides no parallelism benefit
+        # anyway — use main-thread async CUDA stream + events instead.
+        self.swap_events = {}
+        self.swap_stream = torch.cuda.Stream() if device.type == "cuda" else None
         self.cuda_available = device.type == "cuda"
 
     def swap_weight_devices(self, block_to_cpu: nn.Module, block_to_cuda: nn.Module):
@@ -152,41 +155,43 @@ class Offloader:
             swap_weight_devices_no_cuda(self.device, block_to_cpu, block_to_cuda)
 
     def _submit_move_blocks(self, block_idx_to_cpu, block_idx_to_cuda):
-        def move_blocks(bidx_to_cpu, block_to_cpu, bidx_to_cuda, block_to_cuda):
-            if self.debug:
-                start_time = time.perf_counter()
-                print(
-                    f"[{self.block_type}] Move block {bidx_to_cpu} to CPU and block {bidx_to_cuda} to {'CUDA' if self.cuda_available else 'device'}"
-                )
-
-            self.swap_weight_devices(block_to_cpu, block_to_cuda)
-
-            if self.debug:
-                print(f"[{self.block_type}] Moved blocks {bidx_to_cpu} and {bidx_to_cuda} in {time.perf_counter()-start_time:.2f}s")
-            return bidx_to_cpu, bidx_to_cuda  # , event
+        if self.debug:
+            start_time = time.perf_counter()
+            print(
+                f"[{self.block_type}] Move block {block_idx_to_cpu} to CPU and block {block_idx_to_cuda} to {'CUDA' if self.cuda_available else 'device'}"
+            )
 
         block_to_cpu = self.blocks[block_idx_to_cpu]
         block_to_cuda = self.blocks[block_idx_to_cuda]
 
-        self.futures[block_idx_to_cuda] = self.thread_pool.submit(
-            move_blocks, block_idx_to_cpu, block_to_cpu, block_idx_to_cuda, block_to_cuda
-        )
+        # Execute swap on main thread using dedicated CUDA stream (async).
+        # The swap_weight_devices_cuda already uses a module-level _swap_stream
+        # and records synchronizations there — we just need to record an event
+        # so wait_for_block can synchronize the main compute stream.
+        self.swap_weight_devices(block_to_cpu, block_to_cuda)
+
+        if self.debug:
+            print(f"[{self.block_type}] Moved blocks {block_idx_to_cpu} and {block_idx_to_cuda} in {time.perf_counter()-start_time:.2f}s")
+
+        if self.cuda_available:
+            event = torch.cuda.Event()
+            event.record(self.swap_stream)
+            self.swap_events[block_idx_to_cuda] = event
 
     def _wait_blocks_move(self, block_idx):
-        if block_idx not in self.futures:
-            return
-
-        if self.debug:
-            print(f"[{self.block_type}] Wait for block {block_idx}")
-            start_time = time.perf_counter()
-
-        future = self.futures.pop(block_idx)
-        _, bidx_to_cuda = future.result()
-
-        assert block_idx == bidx_to_cuda, f"Block index mismatch: {block_idx} != {bidx_to_cuda}"
-
-        if self.debug:
-            print(f"[{self.block_type}] Waited for block {block_idx}: {time.perf_counter()-start_time:.2f}s")
+        if self.cuda_available and block_idx in self.swap_events:
+            if self.debug:
+                print(f"[{self.block_type}] Wait for block {block_idx}")
+                start_time = time.perf_counter()
+            event = self.swap_events.pop(block_idx)
+            torch.cuda.current_stream().wait_event(event)
+            if self.debug:
+                print(f"[{self.block_type}] Waited for block {block_idx}: {time.perf_counter()-start_time:.2f}s")
+        elif not self.cuda_available and hasattr(self, '_futures') and block_idx in getattr(self, '_futures', {}):
+            # Legacy path: if futures still exist (shouldn't happen after the fix)
+            future = self._futures.pop(block_idx)
+            _, bidx_to_cuda = future.result()
+            assert block_idx == bidx_to_cuda, f"Block index mismatch: {block_idx} != {bidx_to_cuda}"
 
 
 class ModelOffloader(Offloader):
@@ -280,7 +285,7 @@ class ModelOffloader(Offloader):
             weights_to_device(b, torch.device('cpu'))  # make sure weights are on cpu
             # Pin CPU weights for faster non-blocking H2D/D2H transfer.
             # non_blocking=True only works with pinned memory; without it,
-            # the async swap in ThreadPoolExecutor degrades to synchronous.
+            # the async swap degrades to synchronous.
             for name, module in b.named_modules():
                 if 'lora' not in name and hasattr(module, 'weight') and module.weight is not None:
                     if not module.weight.data.is_pinned():

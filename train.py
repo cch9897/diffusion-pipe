@@ -239,14 +239,16 @@ def evaluate(model, model_engine, eval_dataloaders, tb_writer, step, eval_gradie
         return
     empty_cuda_cache()
     model.prepare_block_swap_inference(disable_block_swap=disable_block_swap)
-    with torch.no_grad(), isolate_rng():
-        seed = get_rank()
-        random.seed(seed)
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps)
-    empty_cuda_cache()
-    model.prepare_block_swap_training()
+    try:
+        with torch.no_grad(), isolate_rng():
+            seed = get_rank()
+            random.seed(seed)
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps)
+    finally:
+        empty_cuda_cache()
+        model.prepare_block_swap_training()
 
 
 def distributed_init(args):
@@ -695,6 +697,13 @@ if __name__ == '__main__':
             klass = getattr(pytorch_optimizer, optim_type)
 
         if optim_config.get('gradient_release', False):
+            if config.get('pipeline_stages', 1) > 1:
+                raise ValueError(
+                    'gradient_release is incompatible with pipeline_stages > 1. '
+                    'gradient_release uses per-parameter optimizers and modifies '
+                    'parameter .data.add_() which bypasses DeepSpeed pipeline scheduling. '
+                    'Set pipeline_stages=1 or disable gradient_release.'
+                )
             # Prevent deepspeed from logging every single param group lr
             def _report_progress(self, step):
                 lr = self.get_lr()
@@ -909,9 +918,14 @@ if __name__ == '__main__':
     empty_cuda_cache()
 
     # Cross-step data prefetch: overlap next step's data preparation with current step's GPU compute.
+    # NOTE: Disabled when pipeline_stages > 1 because _broadcast_target() performs
+    # dist.send/recv on the default NCCL communicator, which races with train_batch()
+    # NCCL operations. NCCL does not guarantee thread safety on the same communicator
+    # for concurrent point-to-point and collective operations — this can cause deadlocks
+    # or silent data corruption.
     from concurrent.futures import ThreadPoolExecutor
     _prefetch_executor = None
-    if model_engine.is_first_stage() or model_engine.is_last_stage():
+    if (model_engine.is_first_stage() or model_engine.is_last_stage()) and not model_engine.is_pipe_parallel:
         _prefetch_executor = ThreadPoolExecutor(max_workers=1)
     _prefetch_future = None
 

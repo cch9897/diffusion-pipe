@@ -8,6 +8,7 @@ import hashlib
 import json
 import tarfile
 from inspect import signature
+import threading
 import sys
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
@@ -1352,6 +1353,7 @@ class PipelineDataLoader:
         self.pin_memory = False  # Can be enabled when not using torch.compile
         self.iter_called = False
         self.eval_quantile = None
+        self._epoch_lock = threading.Lock()
         self.epoch = 1
         self.num_batches_pulled = 0
         self.next_micro_batch = None
@@ -1361,7 +1363,8 @@ class PipelineDataLoader:
         self.data = self._pull_batches_from_dataloader()
 
     def reset(self):
-        self.epoch = 1
+        with self._epoch_lock:
+            self.epoch = 1
         self.num_batches_pulled = 0
         self.next_micro_batch = None
         self.data = self._pull_batches_from_dataloader()
@@ -1389,7 +1392,8 @@ class PipelineDataLoader:
             self.data = self._pull_batches_from_dataloader()
             self.num_batches_pulled = 0
             self.next_micro_batch = None
-            self.epoch += 1
+            with self._epoch_lock:
+                self.epoch += 1
         return ret
 
     def _create_dataloader(self, skip_first_n_batches=None):
@@ -1445,23 +1449,26 @@ class PipelineDataLoader:
     # to know the epoch, so we synchronize the epoch so the processes that don't use the dataloader
     # know the current epoch.
     def sync_epoch(self):
-        process_group = dist.get_world_group()
-        result = [None] * dist.get_world_size(process_group)
-        torch.distributed.all_gather_object(result, self.epoch, group=process_group)
-        max_epoch = -1
-        for epoch in result:
-            max_epoch = max(epoch, max_epoch)
-        self.epoch = max_epoch
+        with self._epoch_lock:
+            process_group = dist.get_world_group()
+            result = [None] * dist.get_world_size(process_group)
+            torch.distributed.all_gather_object(result, self.epoch, group=process_group)
+            max_epoch = -1
+            for epoch in result:
+                max_epoch = max(epoch, max_epoch)
+            self.epoch = max_epoch
 
     def state_dict(self):
-        return {
-            'epoch': self.epoch,
-            'num_batches_pulled': self.num_batches_pulled,
-        }
+        with self._epoch_lock:
+            return {
+                'epoch': self.epoch,
+                'num_batches_pulled': self.num_batches_pulled,
+            }
 
     def load_state_dict(self, state_dict):
         assert not self.iter_called
-        self.epoch = state_dict['epoch']
+        with self._epoch_lock:
+            self.epoch = state_dict['epoch']
         # -1 because by preloading the next micro_batch, it's always going to have one more batch
         # pulled than the actual number of batches iterated by the caller.
         self.num_batches_pulled = state_dict['num_batches_pulled'] - 1

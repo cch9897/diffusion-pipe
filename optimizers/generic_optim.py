@@ -489,11 +489,13 @@ class GenericOptim(Optimizer):
                     # bit-identical to Neumaier but without the 3-temp-tensor overhead.
                     if 'shift' not in state:
                         state['shift'] = torch.zeros_like(p)
+                        state['_temp'] = torch.empty_like(p)
                     shift = state['shift'].to(p.device, non_blocking=True)
+                    temp = state['_temp'].to(p.device, non_blocking=True)
                     shift.add_(update)                 # shift = comp + update
-                    p.grad.copy_(p.detach())           # reuse p.grad as temp buffer (grad already consumed)
+                    temp.copy_(p.detach())             # use dedicated temp buffer, preserve p.grad
                     p.add_(shift)                      # bf16-rounded addition
-                    shift.add_(p.grad.sub_(p))         # recover rounding error: comp = -(rounding error)
+                    shift.add_(temp.sub_(p))           # recover rounding error: comp = -(rounding error)
                     # TODO: non_blocking=True here causes CUDA error on first step after checkpoint save.
                     state['shift'] = shift.to(kahan_buffer_device)
                 else:
