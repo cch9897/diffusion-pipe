@@ -70,11 +70,13 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
                     # )
                     module_to_cuda.weight.data = module_to_cuda.weight.data.to(device)
 
-    torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
-
     global _swap_stream
     if _swap_stream is None:
         _swap_stream = torch.cuda.Stream()
+    # Ensure pending compute on main stream completes before swap
+    # reads weights. Stream wait (non-blocking) instead of full
+    # synchronize to preserve compute↔swap overlap.
+    _swap_stream.wait_stream(torch.cuda.current_stream())
     stream = _swap_stream
     with torch.cuda.stream(stream):
         # D2H and H2D operate on different tensors, so they can be submitted
@@ -140,12 +142,6 @@ class Offloader:
         self.device = device
         self.debug = debug
 
-        # CUDA context is thread-local; ThreadPoolExecutor creates threads
-        # that may not have a proper CUDA context, risking stream operations
-        # becoming no-ops. max_workers=1 provides no parallelism benefit
-        # anyway — use main-thread async CUDA stream + events instead.
-        self.swap_events = {}
-        self.swap_stream = torch.cuda.Stream() if device.type == "cuda" else None
         self.cuda_available = device.type == "cuda"
 
     def swap_weight_devices(self, block_to_cpu: nn.Module, block_to_cuda: nn.Module):
@@ -164,34 +160,22 @@ class Offloader:
         block_to_cpu = self.blocks[block_idx_to_cpu]
         block_to_cuda = self.blocks[block_idx_to_cuda]
 
-        # Execute swap on main thread using dedicated CUDA stream (async).
-        # The swap_weight_devices_cuda already uses a module-level _swap_stream
-        # and records synchronizations there — we just need to record an event
-        # so wait_for_block can synchronize the main compute stream.
+        # swap_weight_devices_cuda handles all CUDA synchronization internally:
+        # - _swap_stream.wait_stream(current_stream) to ensure compute is done
+        #   before reading weights (non-blocking dependency)
+        # - _swap_stream.synchronize() to ensure D2H/H2D are complete
+        # - current_stream().wait_stream(_swap_stream) so the main compute
+        #   stream waits for swapped data before using it
         self.swap_weight_devices(block_to_cpu, block_to_cuda)
 
         if self.debug:
             print(f"[{self.block_type}] Moved blocks {block_idx_to_cpu} and {block_idx_to_cuda} in {time.perf_counter()-start_time:.2f}s")
 
-        if self.cuda_available:
-            event = torch.cuda.Event()
-            event.record(self.swap_stream)
-            self.swap_events[block_idx_to_cuda] = event
-
     def _wait_blocks_move(self, block_idx):
-        if self.cuda_available and block_idx in self.swap_events:
-            if self.debug:
-                print(f"[{self.block_type}] Wait for block {block_idx}")
-                start_time = time.perf_counter()
-            event = self.swap_events.pop(block_idx)
-            torch.cuda.current_stream().wait_event(event)
-            if self.debug:
-                print(f"[{self.block_type}] Waited for block {block_idx}: {time.perf_counter()-start_time:.2f}s")
-        elif not self.cuda_available and hasattr(self, '_futures') and block_idx in getattr(self, '_futures', {}):
-            # Legacy path: if futures still exist (shouldn't happen after the fix)
-            future = self._futures.pop(block_idx)
-            _, bidx_to_cuda = future.result()
-            assert block_idx == bidx_to_cuda, f"Block index mismatch: {block_idx} != {bidx_to_cuda}"
+        # Synchronization handled by swap_weight_devices_cuda's
+        # current_stream().wait_stream(_swap_stream) — the main compute
+        # stream already depends on swap completion.
+        pass
 
 
 class ModelOffloader(Offloader):
