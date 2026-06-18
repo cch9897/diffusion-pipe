@@ -725,6 +725,9 @@ class CosmosPredict2Pipeline(BasePipeline):
     def save_model(self, save_dir, state_dict):
         # Split fused keys back to legacy layout for ComfyUI compatibility.
         state_dict = _split_state_dict_keys(state_dict)
+        # Make tensors contiguous — split slices may be non-contiguous views,
+        # which breaks safetensors' tensor.view(-1) in _find_shared_tensors.
+        state_dict = {k: v.contiguous() for k, v in state_dict.items()}
         state_dict = {'net.'+k: v for k, v in state_dict.items()}
         safetensors.torch.save_file(state_dict, save_dir / 'model.safetensors', metadata={'format': 'pt'})
 
