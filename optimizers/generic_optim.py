@@ -498,6 +498,7 @@ class GenericOptim(Optimizer):
                     shift.add_(temp.sub_(p))           # recover rounding error: comp = -(rounding error)
                     # TODO: non_blocking=True here causes CUDA error on first step after checkpoint save.
                     state['shift'] = shift.to(kahan_buffer_device)
+                    state['_temp'] = temp.to(kahan_buffer_device)
                 else:
                     p.add_(update)
 
