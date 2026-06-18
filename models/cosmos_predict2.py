@@ -885,7 +885,7 @@ class CosmosPredict2Pipeline(BasePipeline):
     def get_param_groups(self, parameters):
         base_params, self_attn_params, cross_attn_params, mlp_params, mod_params, llm_adapter_params = [], [], [], [], [], []
         for p in parameters:
-            name = p.original_name
+            name = getattr(p, 'original_name', '')
             if 'llm_adapter' in name:
                 llm_adapter_params.append(p)
             elif '.self_attn' in name:
