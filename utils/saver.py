@@ -61,6 +61,9 @@ class Saver:
         save_dir = self.save_root / name
         tmp_dir = save_dir / 'tmp'
         if dp_id == 0 and stage_id == 0:
+            # Clean up any stale tmp/ from a previous interrupted save before starting fresh.
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
             os.makedirs(tmp_dir, exist_ok=False)
         dist.barrier()
         if dp_id == 0:
@@ -90,6 +93,9 @@ class Saver:
         save_dir = self.save_root / name
         tmp_dir = save_dir / 'tmp'
         if dp_id == 0 and stage_id == 0:
+            # Clean up any stale tmp/ from a previous interrupted save before starting fresh.
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
             os.makedirs(tmp_dir, exist_ok=False)
         dist.barrier()
         if dp_id == 0:
