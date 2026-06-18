@@ -322,6 +322,14 @@ class BasePipeline(CommonPipeline):
     def _remap_adapter_state_dict(self, state_dict):
         """Hook for pipelines to remap legacy adapter keys. Default: no-op."""
         return state_dict
+    def remap_checkpoint_state_dict(self, layer_state_dict):
+        """Remap legacy checkpoint keys to the current model layout.
+
+        Called when resuming from a checkpoint saved with a different model
+        structure (e.g. before QKV/AdaLN fusion). Returns a state_dict with
+        keys matching the current layer's parameters. Default: no-op.
+        """
+        return layer_state_dict
 
     def load_and_fuse_adapter(self, path):
         peft_config = peft.LoraConfig.from_pretrained(path)

@@ -681,6 +681,7 @@ class CosmosPredict2Pipeline(BasePipeline):
         state_dict = _remap_state_dict_keys(state_dict)
 
         dit_config = get_dit_config(state_dict)
+        dit_config['attention_backend'] = self.model_config.get('attention_backend')
 
         if 'llm_adapter_path' in self.model_config:
             self.use_llm_adapter = True
@@ -748,6 +749,10 @@ class CosmosPredict2Pipeline(BasePipeline):
         """Remap legacy LoRA keys (q_proj/k_proj/v_proj -> qkv_proj,
         adaln_modulation_{self,cross,mlp} -> adaln_modulation_1/2) to the fused layout."""
         return _remap_lora_keys(state_dict)
+    def remap_checkpoint_state_dict(self, layer_state_dict):
+        """Remap legacy checkpoint keys (q_proj/k_proj/v_proj -> qkv_proj,
+        adaln_modulation_{self,cross,mlp} -> adaln_modulation_1/2) to the fused layout."""
+        return _remap_state_dict_keys(layer_state_dict)
 
     def get_preprocess_media_file_fn(self):
         return PreprocessMediaFile(
@@ -844,12 +849,24 @@ class CosmosPredict2Pipeline(BasePipeline):
         if self.model_config.get('torch_compile', False):
             compile_mode = self.model_config.get('torch_compile_mode', 'default')
             compile_dynamic = self.model_config.get('torch_compile_dynamic', False)
+            # activation_checkpointing='unsloth' wraps the block forward in
+            # @torch._disable_dynamo, making compile a silent no-op.
+            if self.config.get('activation_checkpointing') == 'unsloth':
+                raise ValueError(
+                    'torch_compile=true is incompatible with activation_checkpointing="unsloth". '
+                    'unsloth wraps the block forward in @torch._disable_dynamo, so compile becomes a no-op. '
+                    'Set activation_checkpointing=true (native, keeps activations in VRAM) or =false to use torch_compile.'
+                )
+            # blocks_to_swap mutates module.weight.data on every step, invalidating
+            # dynamo guards and triggering recompiles on every step.
+            if self.config.get('blocks_to_swap', 0):
+                raise ValueError(
+                    'torch_compile=true is incompatible with blocks_to_swap > 0. '
+                    'blocks_to_swap mutates module.weight.data on every step, which invalidates '
+                    'dynamo guards and triggers recompilation. Set blocks_to_swap=0 to use torch_compile.'
+                )
             if is_main_process():
                 print(f'Compiling transformer blocks with torch.compile (mode={compile_mode!r}, dynamic={compile_dynamic}, fullgraph=False)...')
-                if self.config.get('activation_checkpointing') == 'unsloth':
-                    print('  warning: activation_checkpointing="unsloth" wraps the block in @torch._disable_dynamo; compile will be a no-op.')
-                if self.config.get('blocks_to_swap', 0):
-                    print('  warning: blocks_to_swap mutates module.weight.data on every step; this can invalidate dynamo guards and trigger recompiles.')
                 if self.model_config.get('transformer_dtype') == torch.float8_e4m3fn:
                     print('  warning: transformer_dtype=float8 has limited dynamo support; expect graph breaks.')
                 if not compile_dynamic:
@@ -1023,7 +1040,12 @@ class InitialLayer(nn.Module):
         t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
         t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
 
-        outputs =  make_contiguous(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, t5_input_ids, attn_mask, t5_attn_mask, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
+        # Only x needs contiguous — the other 8 tensors are read-only (int/bool
+        # tensors like t5_input_ids/attn_mask are unaffected, and the float tensors
+        # are computed fresh each step). TransformerLayer.forward already re-contiguifies
+        # x after each block, and LLMAdapterLayer re-contiguifies crossattn_emb.
+        x_B_T_H_W_D = x_B_T_H_W_D.contiguous()
+        outputs = (x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, t5_input_ids, attn_mask, t5_attn_mask, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
         for tensor in outputs:
             if torch.is_floating_point(tensor):
                 tensor.requires_grad_(True)

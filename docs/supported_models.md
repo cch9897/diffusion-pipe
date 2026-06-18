@@ -568,13 +568,57 @@ Notes:
 - You can control the llm_adapter learning rate separately. This is an adapter that processes the Qwen3 embeddings before feeding into the diffusion model.
   - Setting `llm_adapter_lr=0` disables training it entirely. This probably makes training more stable for small datasets.
   - If you have a larger dataset or a lot of brand-new concepts, you can try training the llm_adapter and see if it helps.
-- `torch_compile = true` enables per-block `torch.compile`. Known incompatibilities:
-  - `activation_checkpointing = 'unsloth'` wraps the block forward in `@torch._disable_dynamo`, so compile becomes a no-op.
-  - `blocks_to_swap > 0` mutates `module.weight.data` on every step, which can invalidate dynamo guards and trigger recompiles.
-  - `transformer_dtype = 'float8'` has limited dynamo coverage and may cause graph breaks.
+- `torch_compile = true` enables per-block `torch.compile`. Hard incompatibilities (raise `ValueError`):
+  - `activation_checkpointing = 'unsloth'` wraps the block forward in `@torch._disable_dynamo`, so compile cannot run. Use `activation_checkpointing = true` (native) instead.
+  - `blocks_to_swap > 0` mutates `module.weight.data` on every step, which invalidates dynamo guards and triggers recompiles.
+  - `transformer_dtype = 'float8'` has limited dynamo coverage and may cause graph breaks (warning only).
   - Many size buckets will cause one recompile per new (block, shape) pair under default settings; either set `torch_compile_dynamic = true` (slightly less optimized graph, but no churn) or leave compile off.
 
 Anima LoRAs are saved in ComfyUI format.
+
+### Full Fine-Tuning (FFT) on 32 GB VRAM
+
+Anima is a 2.36 B parameter model (DiT 2.22 B + LLMAdapter 0.135 B, `model_channels=2048`, 28 blocks, 16 heads). FFT fits on a single 32 GB GPU **with zero optimizer-state offload to RAM**, provided you pick the right optimizer and enable activation checkpointing. Two recommended configs:
+
+**Config A — `adamw8bitkahan` (~18 GB, preferred):**
+```
+[optimizer]
+type = 'adamw8bitkahan'
+
+[model]
+type = 'anima'
+# ... paths ...
+activation_checkpointing = 'unsloth'
+blocks_to_swap = 0          # FFT cannot use block swap (LoRA-only, asserted in train.py)
+gradient_release = false
+train_micro_batch_size_per_gpu = 1
+```
+Memory: weights 4.71 GB (bf16) + grads 4.71 GB + 8-bit Adam m/v 4.71 GB + Kahan shift 4.71 GB ≈ **18.3 GB**. Leaves ~13 GB headroom for t5/llm_adapter forward, grad-clip temporaries, and CUDA workspace.
+
+**Config B — `genericoptim` (~23 GB, bf16 optimizer states):**
+```
+[optimizer]
+type = 'genericoptim'
+# kahan_buffer_offload defaults to false (GPU-resident) — do NOT set it to true
+# or the 4.71 GB Kahan shift does a PCIe round-trip every step → slowdown.
+
+[model]
+type = 'anima'
+# ... paths ...
+activation_checkpointing = 'unsloth'
+blocks_to_swap = 0
+gradient_release = false
+train_micro_batch_size_per_gpu = 1
+```
+Memory: weights 4.71 + grads 4.71 + exp_avg 4.71 + exp_avg_sq 4.71 + shift 4.71 ≈ **22.8 GB** (all bf16 states). Leaves ~9 GB headroom.
+
+**Activation checkpointing is required.** Without it, 28 blocks × 5 tensors × 16.8 MB ≈ 7 GB of activations push the `genericoptim` path to ~30 GB — too close to the 32 GB ceiling. Two options:
+  - `activation_checkpointing = 'unsloth'` (recommended): offloads each block's input to pinned RAM, overlapping the H2D copy with compute. This is one-shot checkpoint I/O, not sustained optimizer-state offload — it does not cause the persistent slowdown the 32 GB constraint targets.
+  - `activation_checkpointing = true` (native non-reentrant): keeps activations in VRAM, recomputes in backward. Uses more VRAM (~7 GB extra) but does zero RAM access. Use this if you want strictly zero host memory traffic, or if you want `torch_compile` (unsloth is incompatible with compile — see below).
+
+**`torch_compile` trade-off:** FFT's recommended `activation_checkpointing = 'unsloth'` is incompatible with `torch_compile` — this is now a hard `ValueError`, not a silent no-op. If you want compile's 5–10% throughput gain, switch to `activation_checkpointing = true` (native) or `= false` (no checkpointing, ~7 GB more VRAM). With native ckpt + `genericoptim` you're at ~29.8 GB; with `adamw8bitkahan` + native ckpt you're at ~25.3 GB (safer).
+
+**`transformer_engine` attention backend (15–30% speedup):** If `transformer_engine` is installed, the DiT auto-selects TE's fused FlashAttention-2 kernel. Set `attention_backend = 'torch'` to force the PyTorch fallback. Install TE with `pip install transformer-engine` to get the 15–30% step-time reduction.
 
 
 ## Ernie-Image

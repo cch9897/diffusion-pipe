@@ -1211,8 +1211,13 @@ class MiniTrainDIT(nn.Module):
         extra_t_extrapolation_ratio: float = 1.0,
         rope_enable_fps_modulation: bool = True,
         use_llm_adapter=False,
+        attention_backend: str = None,
     ) -> None:
-        atten_backend = 'torch'
+        # Default to transformer_engine when available; fall back to torch.
+        # Users can force 'torch' via model_config['attention_backend'].
+        if attention_backend is None:
+            attention_backend = 'transformer_engine' if DotProductAttention is not None else 'torch'
+        atten_backend = attention_backend
 
         super().__init__()
         self.max_img_h = max_img_h

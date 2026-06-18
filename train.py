@@ -280,6 +280,65 @@ def _get_automagic_lrs(optimizer):
             lrs.append(lr)
     lrs = torch.stack(lrs)
     return lrs, lrs.mean()
+def _remap_legacy_checkpoint(model_engine, pipeline_model, model):
+    """Remap legacy checkpoint keys to the current model layout after DeepSpeed loads.
+
+    DeepSpeed PipelineModule saves/loads checkpoints per-layer. When the checkpoint
+    was saved with a different model structure (e.g. pre-QKV-fusion: separate
+    q_proj/k_proj/v_proj vs fused qkv_proj), load_state_dict(strict=False) silently
+    skips unmatched keys, leaving fused parameters at their initialization values.
+
+    This reads each layer's checkpoint file from disk, applies the pipeline's
+    remap_checkpoint_state_dict hook to convert legacy keys → current keys, and
+    reloads the remapped state_dict into the layer. Only layers whose checkpoint
+    contains legacy keys are reloaded.
+    """
+    if not hasattr(model_engine, '_curr_ckpt_path') or model_engine._curr_ckpt_path is None:
+        return
+    ckpt_dir = model_engine._curr_ckpt_path
+    if not os.path.isdir(ckpt_dir):
+        return
+
+    remap_fn = getattr(model, 'remap_checkpoint_state_dict', None)
+    if remap_fn is None:
+        return
+
+    grid = model_engine.grid
+    mp_rank = 0 if grid is None else grid.get_slice_parallel_rank()
+    mp_world_size = 1 if grid is None else grid.get_slice_parallel_world_size()
+
+    remapped_count = 0
+    for idx, layer in enumerate(pipeline_model.forward_funcs):
+        if not hasattr(layer, 'load_state_dict'):
+            continue
+        # Reuse the same path resolution as PipelineModule.ckpt_layer_path_list
+        layer_idx = idx + pipeline_model._local_start
+        pattern = os.path.join(ckpt_dir, f'layer_{layer_idx:02d}-*model_states.pt')
+        ckpt_files = sorted(glob.glob(pattern))
+        if len(ckpt_files) == 0:
+            continue
+        # Pick this rank's shard (same logic as SDLoaderFactory for pipe-parallel)
+        ckpt_file = ckpt_files[mp_rank % len(ckpt_files)]
+        try:
+            ckpt_sd = torch.load(ckpt_file, map_location='cpu', weights_only=True)
+        except Exception:
+            continue
+        remapped_sd = remap_fn(ckpt_sd)
+        if remapped_sd is ckpt_sd:
+            # No remap happened (identity) — skip
+            continue
+        # Detect if any legacy keys were actually remapped (non-identity)
+        if set(remapped_sd.keys()) == set(ckpt_sd.keys()):
+            continue
+        layer.load_state_dict(remapped_sd, strict=False)
+        remapped_count += 1
+        if is_main_process():
+            print(f'  [checkpoint remap] layer {idx}: remapped {len(ckpt_sd)} -> {len(remapped_sd)} keys')
+
+    if remapped_count > 0 and is_main_process():
+        print(f'Checkpoint remap complete: {remapped_count} layers had legacy keys remapped to fused layout.')
+        print('WARNING: optimizer state for remapped parameters may be stale (from pre-fusion training).')
+        print('         Consider using --reset_optimizer if you observe training instability.')
 
 
 if __name__ == '__main__':
@@ -740,27 +799,53 @@ if __name__ == '__main__':
             if 'momentum' in kwargs:
                 kwargs['momentum'] = kwargs['momentum'] ** (1/gas)
 
+            # We're doing an optimizer step for each micro-batch, so the effective
+            # update frequency is GAS× higher than normal. Scale lr by 1/gas by
+            # default so the per-step contribution matches one-step-per-batch.
+            # Set gas_lr_scale=1.0 to keep the original (unscaled) lr.
+            gas_lr_scale = optim_config.get('gas_lr_scale', 1.0 / gas)
+
+            # Group params by lr so params sharing a learning rate share one optimizer
+            # instance instead of one-per-param. register_post_accumulate_grad_hook fires
+            # per-param, but torch optimizer.step() only updates params whose .grad is set,
+            # so a shared instance steps correctly for a single param. This reduces
+            # kernel launches from N_params to N_groups.
             optimizer_dict = {}
+            grouped = {}  # lr_key -> (lr_value, [params])
             for pg in model.get_param_groups(model_parameters):
-                param_kwargs = kwargs.copy()
                 if isinstance(pg, dict):
-                    # param group
-                    for p in pg['params']:
-                        param_kwargs['lr'] = pg['lr']
-                        optimizer_dict[p] = klass([p], **param_kwargs)
+                    lr_key = pg['lr']
                 else:
-                    # param
-                    optimizer_dict[pg] = klass([pg], **param_kwargs)
+                    # bare param — use the top-level lr from kwargs
+                    lr_key = kwargs.get('lr')
+                    pg = {'params': [pg], 'lr': lr_key}
+                grouped.setdefault(lr_key, [lr_key, []])[1].extend(pg['params'])
+
+            # One optimizer instance per unique lr. Each param maps to its shared optimizer.
+            shared_optimizers = []
+            for lr_key, (lr_value, params) in grouped.items():
+                if lr_value == 0:
+                    for p in params:
+                        p.requires_grad_(False)
+                    continue
+                param_kwargs = kwargs.copy()
+                param_kwargs['lr'] = lr_value * gas_lr_scale
+                opt = klass(params, **param_kwargs)
+                shared_optimizers.append(opt)
+                for p in params:
+                    optimizer_dict[p] = opt
 
             def optimizer_hook(p):
                 optimizer_dict[p].step()
-                optimizer_dict[p].zero_grad()
+                # Set only this param's grad to None — not zero_grad() on the shared
+                # optimizer, which would wipe other params' not-yet-consumed grads.
+                p.grad = None
 
             for p in model_parameters:
                 p.register_post_accumulate_grad_hook(optimizer_hook)
 
             from optimizers import gradient_release
-            return gradient_release.GradientReleaseOptimizerWrapper(list(optimizer_dict.values()))
+            return gradient_release.GradientReleaseOptimizerWrapper(shared_optimizers)
         elif optim_type_lower == 'genericoptim':
             kwargs['compile'] = config['compile']
             kwargs['mpu'] = pipeline_model.mpu()
@@ -893,6 +978,15 @@ if __name__ == '__main__':
         del client_state
         if is_main_process():
             print(f'Resuming training from checkpoint. Resuming at epoch: {train_dataloader.epoch}, step: {step}')
+
+        # Remap legacy checkpoint keys to the current model layout.
+        # This handles the case where the checkpoint was saved with a different
+        # model structure (e.g. before QKV/AdaLN fusion). DeepSpeed loads per-layer
+        # checkpoint files with load_state_dict(strict=False), so legacy keys that
+        # don't match the current fused parameter names are silently skipped,
+        # leaving fused params at their initialization values (e.g.
+        # adaln_modulation_2 stays zero-initialized → all modulation lost → black images).
+        _remap_legacy_checkpoint(model_engine, pipeline_model, model)
 
     if 'force_constant_lr' in config:
         model_engine.lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
