@@ -13,16 +13,13 @@ class ManualPipelineModule(PipelineModule):
         self.manual_partition_split = manual_partition_split
         # Workaround PyTorch 2.12: Module.to() no longer supports meta→device.
         # DeepSpeed PipelineModule.__init__ calls self.to(device) on meta-param layers.
-        # Patch nn.Module.to → nn.Module.to_empty for the super().__init__ duration.
+        # Catch the NotImplementedError and retry with to_empty().
         _original_to = nn.Module.to
         def _to_empty_fallback(module, *to_args, **to_kwargs):
             try:
-                for p in module.parameters():
-                    if p.device.type == 'meta':
-                        return module.to_empty(*to_args, **to_kwargs)
-            except Exception:
-                pass
-            return _original_to(module, *to_args, **to_kwargs)
+                return _original_to(module, *to_args, **to_kwargs)
+            except NotImplementedError:
+                return module.to_empty(*to_args, **to_kwargs)
         nn.Module.to = _to_empty_fallback
         try:
             super().__init__(*args, **kwargs)
