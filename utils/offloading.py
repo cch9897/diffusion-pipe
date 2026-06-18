@@ -91,8 +91,12 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
             cuda_data_view.copy_(module_to_cuda.weight.data, non_blocking=True)
             module_to_cuda.weight.data = cuda_data_view
 
-    stream.synchronize()
+    # Record event instead of synchronize() to avoid blocking the calling
+    # thread. The event is stored and waited on in _wait_blocks_move.
+    event = torch.cuda.Event()
+    event.record(stream)
     torch.cuda.current_stream().wait_stream(stream)  # prevents illegal loss value without full sync
+    return event
 
 
 def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
@@ -143,12 +147,14 @@ class Offloader:
         self.debug = debug
 
         self.cuda_available = device.type == "cuda"
+        self.swap_events = {}  # block_idx -> CUDA event for CPU-side sync
 
     def swap_weight_devices(self, block_to_cpu: nn.Module, block_to_cuda: nn.Module):
         if self.cuda_available:
-            swap_weight_devices_cuda(self.device, block_to_cpu, block_to_cuda)
+            return swap_weight_devices_cuda(self.device, block_to_cpu, block_to_cuda)
         else:
             swap_weight_devices_no_cuda(self.device, block_to_cpu, block_to_cuda)
+            return None
 
     def _submit_move_blocks(self, block_idx_to_cpu, block_idx_to_cuda):
         if self.debug:
@@ -163,19 +169,29 @@ class Offloader:
         # swap_weight_devices_cuda handles all CUDA synchronization internally:
         # - _swap_stream.wait_stream(current_stream) to ensure compute is done
         #   before reading weights (non-blocking dependency)
-        # - _swap_stream.synchronize() to ensure D2H/H2D are complete
         # - current_stream().wait_stream(_swap_stream) so the main compute
         #   stream waits for swapped data before using it
-        self.swap_weight_devices(block_to_cpu, block_to_cuda)
+        # Returns a CUDA event for CPU-side synchronization in _wait_blocks_move.
+        event = self.swap_weight_devices(block_to_cpu, block_to_cuda)
+        if event is not None:
+            self.swap_events[block_idx_to_cuda] = event
 
         if self.debug:
             print(f"[{self.block_type}] Moved blocks {block_idx_to_cpu} and {block_idx_to_cuda} in {time.perf_counter()-start_time:.2f}s")
 
     def _wait_blocks_move(self, block_idx):
-        # Synchronization handled by swap_weight_devices_cuda's
-        # current_stream().wait_stream(_swap_stream) — the main compute
-        # stream already depends on swap completion.
-        pass
+        # CPU-side sync: ensure D2H to CPU memory is complete before
+        # this block's weights are read for the next H2D or forward pass.
+        # CUDA-side sync is handled by swap_weight_devices_cuda's
+        # current_stream().wait_stream(_swap_stream).
+        if block_idx in self.swap_events:
+            if self.debug:
+                print(f"[{self.block_type}] Wait for block {block_idx}")
+                start_time = time.perf_counter()
+            event = self.swap_events.pop(block_idx)
+            event.synchronize()
+            if self.debug:
+                print(f"[{self.block_type}] Waited for block {block_idx}: {time.perf_counter()-start_time:.2f}s")
 
 
 class ModelOffloader(Offloader):
