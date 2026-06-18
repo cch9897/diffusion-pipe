@@ -11,7 +11,23 @@ from deepspeed.runtime.pipe import LayerSpec
 class ManualPipelineModule(PipelineModule):
     def __init__(self, *args, manual_partition_split=None, **kwargs):
         self.manual_partition_split = manual_partition_split
-        super().__init__(*args, **kwargs)
+        # Workaround PyTorch 2.12: Module.to() no longer supports meta→device.
+        # DeepSpeed PipelineModule.__init__ calls self.to(device) on meta-param layers.
+        # Patch nn.Module.to → nn.Module.to_empty for the super().__init__ duration.
+        _original_to = nn.Module.to
+        def _to_empty_fallback(module, *to_args, **to_kwargs):
+            try:
+                for p in module.parameters():
+                    if p.device.type == 'meta':
+                        return module.to_empty(*to_args, **to_kwargs)
+            except Exception:
+                pass
+            return _original_to(module, *to_args, **to_kwargs)
+        nn.Module.to = _to_empty_fallback
+        try:
+            super().__init__(*args, **kwargs)
+        finally:
+            nn.Module.to = _original_to
 
     def _partition_layers(self, method='uniform'):
         if method.lower() == 'manual' and self.manual_partition_split is not None:
