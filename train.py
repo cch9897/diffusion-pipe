@@ -1032,6 +1032,14 @@ if __name__ == '__main__':
     # Kick off the first prefetch
     _prefetch_future = _prefetch_next()
 
+    # Progress bar
+    total_steps = config.get('max_steps', config['epochs'] * steps_per_epoch)
+    if is_main_process():
+        pbar = tqdm(total=total_steps, initial=step, desc='Training',
+                    bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}')
+    else:
+        pbar = None
+
     while True:
         model_engine.reset_activation_shape()
         # Wait for the prefetch to complete (should be ready by now since GPU was busy)
@@ -1045,6 +1053,13 @@ if __name__ == '__main__':
         epoch_loss += loss
         num_steps += 1
         train_dataloader.sync_epoch()
+
+        if pbar is not None:
+            postfix = {'loss': f'{loss:.4f}'}
+            save_every = config.get('save_every_n_steps')
+            if save_every:
+                postfix['save'] = f'{save_every - (step % save_every)}/{save_every}'
+            pbar.set_postfix(postfix)
 
         if step % 50 == 0:
             empty_cuda_cache()
@@ -1092,6 +1107,8 @@ if __name__ == '__main__':
             break
         step += 1
         examples += global_batch_size
+        if pbar is not None:
+            pbar.update(1)
 
     # Save final training state checkpoint and model, unless we just saved them.
     if not checkpointed:
@@ -1100,4 +1117,6 @@ if __name__ == '__main__':
         saver.save_model(final_model_name)
 
     if is_main_process():
+        if pbar is not None:
+            pbar.close()
         print('TRAINING COMPLETE!')
