@@ -1064,7 +1064,7 @@ if __name__ == '__main__':
             for _nm, _p in model_engine.module.named_parameters():
                 if not _p.requires_grad:
                     continue
-                if _p.data.isfloatingpoint():
+                if _p.data.is_floating_point():
                     _has_nan = _p.data.isnan().any().item()
                     _has_inf = _p.data.isinf().any().item()
                     if _has_nan or _has_inf:
