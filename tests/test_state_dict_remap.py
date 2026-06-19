@@ -21,6 +21,7 @@ from models.cosmos_predict2 import (
     _remap_state_dict_keys,
     _split_state_dict_keys,
 )
+from models.cosmos_predict2_modeling import _zero_adaln_modulation_2_offdiag_grad
 
 
 def _legacy_qkv(block_idx=0, D=64, device='cpu'):
@@ -155,6 +156,36 @@ def test_adaln_lora_split_contiguous():
     for k, v in split.items():
         assert v.is_contiguous(), f'Non-contiguous: {k}'
 
+def test_adaln_lora_grad_hook_preserves_split_invariant():
+    D = 8
+    ald = 4
+    grad = torch.ones(9 * D, 3 * ald)
+    _zero_adaln_modulation_2_offdiag_grad(grad, D, ald)
+
+    for row_branch in range(3):
+        for col_branch in range(3):
+            block_grad = grad[row_branch * 3 * D:(row_branch + 1) * 3 * D, col_branch * ald:(col_branch + 1) * ald]
+            if row_branch == col_branch:
+                assert torch.equal(block_grad, torch.ones_like(block_grad))
+            else:
+                assert torch.equal(block_grad, torch.zeros_like(block_grad))
+
+
+def test_anima_t_embedder_adaln_uses_mod_lr():
+    def classify(name):
+        if 'llm_adapter' in name:
+            return 'llm_adapter'
+        if '.self_attn' in name:
+            return 'self_attn'
+        if '.cross_attn' in name:
+            return 'cross_attn'
+        if '.mlp' in name:
+            return 'mlp'
+        if '.adaln_modulation' in name or ('t_embedder' in name and 'adaln' in name):
+            return 'mod'
+        return 'base'
+
+    assert classify('t_embedder.linear_2.weight') == 'mod'
 
 # ── AdaLN nolora ─────────────────────────────────────────────────────
 

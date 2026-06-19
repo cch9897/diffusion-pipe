@@ -985,6 +985,20 @@ class FinalLayer(nn.Module):
         return x_B_T_H_W_O
 
 
+
+
+def _zero_adaln_modulation_2_offdiag_grad(grad: torch.Tensor, x_dim: int, adaln_lora_dim: int) -> torch.Tensor:
+    for row_branch in range(3):
+        row_start = row_branch * 3 * x_dim
+        row_end = row_start + 3 * x_dim
+        for col_branch in range(3):
+            if col_branch == row_branch:
+                continue
+            col_start = col_branch * adaln_lora_dim
+            col_end = col_start + adaln_lora_dim
+            grad[row_start:row_end, col_start:col_end].zero_()
+    return grad
+
 class Block(nn.Module):
     """
     A transformer block that combines self-attention, cross-attention and MLP layers with AdaLN modulation.
@@ -1048,8 +1062,16 @@ class Block(nn.Module):
             adaln_lora_dim_total = 3 * adaln_lora_dim
             self.adaln_modulation_1 = nn.Linear(x_dim, adaln_lora_dim_total, bias=False)
             self.adaln_modulation_2 = nn.Linear(adaln_lora_dim_total, 9 * x_dim, bias=False)
+            self._adaln_modulation_2_grad_hook = None
         else:
             self.adaln_modulation = nn.Linear(x_dim, 9 * x_dim, bias=False)
+
+    def register_adaln_modulation_2_grad_hook(self) -> None:
+        if not self.use_adaln_lora or self._adaln_modulation_2_grad_hook is not None:
+            return
+        self._adaln_modulation_2_grad_hook = self.adaln_modulation_2.weight.register_hook(
+            lambda grad: _zero_adaln_modulation_2_offdiag_grad(grad, self.x_dim, self.adaln_lora_dim)
+        )
 
     def reset_parameters(self) -> None:
         self.layer_norm_self_attn.reset_parameters()

@@ -596,6 +596,7 @@ class CosmosPredict2Pipeline(BasePipeline):
         dtype = self.model_config['dtype']
         self.cache_text_embeddings = self.model_config.get('cache_text_embeddings', True)
         self.multiscale_loss_weight = self.model_config.get('multiscale_loss_weight', None)
+        self.llm_adapter_trainable = self.model_config.get('llm_adapter_lr', self.config['optimizer'].get('lr', None)) != 0
 
         # This isn't a nn.Module.
         self.vae = WanVAE(
@@ -710,6 +711,10 @@ class CosmosPredict2Pipeline(BasePipeline):
             for name, p in llm_adapter.named_parameters():
                 dtype_to_use = dtype if (any(keyword in name for keyword in KEEP_IN_HIGH_PRECISION) or p.ndim == 1) else transformer_dtype
                 set_module_tensor_to_device(llm_adapter, name, device='cpu', dtype=dtype_to_use, value=llm_adapter_state_dict[name])
+
+        for block in transformer.blocks:
+            if hasattr(block, 'register_adaln_modulation_2_grad_hook'):
+                block.register_adaln_modulation_2_grad_hook()
 
         self.transformer = transformer
         self.transformer.train()
@@ -880,8 +885,8 @@ class CosmosPredict2Pipeline(BasePipeline):
                 )
 
         layers = [
-            InitialLayer(transformer, text_encoder, self.is_generic_llm),
-            LLMAdapterLayer(transformer.llm_adapter if self.use_llm_adapter else None),
+            InitialLayer(transformer, text_encoder, self.is_generic_llm, self.llm_adapter_trainable),
+            LLMAdapterLayer(transformer.llm_adapter if self.use_llm_adapter else None, self.llm_adapter_trainable),
         ]
         for i, block in enumerate(transformer.blocks):
             layers.append(TransformerLayer(block, i, self.offloader))
@@ -927,7 +932,7 @@ class CosmosPredict2Pipeline(BasePipeline):
                 cross_attn_params.append(p)
             elif '.mlp' in name:
                 mlp_params.append(p)
-            elif '.adaln_modulation' in name:
+            elif '.adaln_modulation' in name or ('t_embedder' in name and 'adaln' in name):
                 mod_params.append(p)
             else:
                 base_params.append(p)
@@ -964,22 +969,26 @@ class CosmosPredict2Pipeline(BasePipeline):
             with torch.autocast('cuda', enabled=False):
                 output = output.to(torch.float32)
                 target = target.to(output.device, torch.float32)
+                has_mask = mask.numel() > 0
                 if 'huber_delta' in self.config:
                     loss = F.huber_loss(output, target, reduction='none', delta=self.config['huber_delta'])
                 elif 'smooth_l1_beta' in self.config:
                     loss = F.smooth_l1_loss(output, target, reduction='none', beta=self.config['smooth_l1_beta'])
                 else:
                     loss = F.mse_loss(output, target, reduction='none')
-                # empty tensor means no masking
-                if mask.numel() > 0:
+                if has_mask:
                     mask = mask.to(output.device, torch.float32)
                     loss *= mask
-                loss = loss.mean()
+                    loss = loss.sum() / mask.expand_as(loss).sum().clamp_min(1.0)
+                else:
+                    loss = loss.mean()
 
                 if weight := self.multiscale_loss_weight:
                     assert output.ndim == 5 and target.ndim == 5
                     output = output.squeeze(2)
                     target = target.squeeze(2)
+                    if has_mask:
+                        mask = mask.squeeze(2)
                     terms = [loss]
                     total_weight = 1.0
                     h, w = target.shape[-2:]
@@ -988,7 +997,14 @@ class CosmosPredict2Pipeline(BasePipeline):
                         if side_length >= thresh:
                             output = F.avg_pool2d(output, 2)
                             target = F.avg_pool2d(target, 2)
-                            additional_loss = F.mse_loss(output, target) * weight
+                            if has_mask:
+                                mask = F.avg_pool2d(mask, 2)
+                                additional_loss = F.mse_loss(output, target, reduction='none')
+                                additional_loss *= mask
+                                additional_loss = additional_loss.sum() / mask.expand_as(additional_loss).sum().clamp_min(1.0)
+                                additional_loss *= weight
+                            else:
+                                additional_loss = F.mse_loss(output, target) * weight
                             terms.append(additional_loss)
                             total_weight += weight
                         else:
@@ -1000,7 +1016,7 @@ class CosmosPredict2Pipeline(BasePipeline):
 
 
 class InitialLayer(nn.Module):
-    def __init__(self, model, text_encoder, is_generic_llm):
+    def __init__(self, model, text_encoder, is_generic_llm, llm_adapter_trainable):
         super().__init__()
         self.x_embedder = model.x_embedder
         self.pos_embedder = model.pos_embedder
@@ -1011,6 +1027,7 @@ class InitialLayer(nn.Module):
         self.text_encoder = text_encoder
         self.model = [model]
         self.is_generic_llm = is_generic_llm
+        self.llm_adapter_trainable = llm_adapter_trainable
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
@@ -1040,35 +1057,48 @@ class InitialLayer(nn.Module):
         t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
         t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
 
-        # Only x needs contiguous — the other 8 tensors are read-only (int/bool
-        # tensors like t5_input_ids/attn_mask are unaffected, and the float tensors
-        # are computed fresh each step). TransformerLayer.forward already re-contiguifies
-        # x after each block, and LLMAdapterLayer re-contiguifies crossattn_emb.
-        x_B_T_H_W_D = x_B_T_H_W_D.contiguous()
         outputs = (x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, t5_input_ids, attn_mask, t5_attn_mask, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
-        for tensor in outputs:
-            if torch.is_floating_point(tensor):
-                tensor.requires_grad_(True)
+        # Pipeline parallelism needs floating-point tensors that cross stage
+        # boundaries to require grad so DeepSpeed can send their gradients back.
+        # With a frozen LLM adapter, cross-attn embeddings are treated as fixed
+        # conditioning and should not build a dead-end backward graph through it.
+        float_outputs = [x_B_T_H_W_D, t_embedding_B_T_D, rope_emb_L_1_1_D, adaln_lora_B_T_3D]
+        if self.llm_adapter_trainable:
+            float_outputs.append(crossattn_emb)
+        for tensor in float_outputs:
+            tensor.requires_grad_(True)
         return outputs
 
 
 class LLMAdapterLayer(nn.Module):
-    def __init__(self, llm_adapter):
+    def __init__(self, llm_adapter, llm_adapter_trainable):
         super().__init__()
         self.llm_adapter = llm_adapter
+        self.llm_adapter_trainable = llm_adapter_trainable
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, t5_input_ids, attn_mask, t5_attn_mask, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T = inputs
 
         if self.llm_adapter is not None:
-            crossattn_emb = self.llm_adapter(
-                source_hidden_states=crossattn_emb,
-                target_input_ids=t5_input_ids,
-                target_attention_mask=t5_attn_mask,
-                source_attention_mask=attn_mask,
-            )
-            crossattn_emb = crossattn_emb.masked_fill(~t5_attn_mask.bool().unsqueeze(-1), 0)
+            if self.llm_adapter_trainable:
+                crossattn_emb = self.llm_adapter(
+                    source_hidden_states=crossattn_emb,
+                    target_input_ids=t5_input_ids,
+                    target_attention_mask=t5_attn_mask,
+                    source_attention_mask=attn_mask,
+                )
+                crossattn_emb = crossattn_emb.masked_fill(~t5_attn_mask.bool().unsqueeze(-1), 0)
+            else:
+                with torch.no_grad():
+                    crossattn_emb = self.llm_adapter(
+                        source_hidden_states=crossattn_emb,
+                        target_input_ids=t5_input_ids,
+                        target_attention_mask=t5_attn_mask,
+                        source_attention_mask=attn_mask,
+                    )
+                    crossattn_emb = crossattn_emb.masked_fill(~t5_attn_mask.bool().unsqueeze(-1), 0)
+                crossattn_emb.requires_grad_(True)
 
         # Only crossattn_emb changed; x and other tensors are unchanged.
         crossattn_emb = crossattn_emb.contiguous()
