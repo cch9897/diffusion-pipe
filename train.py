@@ -1054,6 +1054,33 @@ if __name__ == '__main__':
         num_steps += 1
         train_dataloader.sync_epoch()
 
+        # ── Gradient diagnostic (remove after debugging) ──────────────
+        if step <= 3 and is_main_process():
+            # 1. Check optimizer param identity vs pipeline model params
+            optim_params = {id(p) for g in optimizer.param_groups for p in g['params']}
+            model_params = {id(p) for p in model_engine.module.parameters() if p.requires_grad}
+            only_optim = optim_params - model_params
+            only_model = model_params - optim_params
+            print(f'[DIAG step={step}] optim_params={len(optim_params)}, model_params(requires_grad)={len(model_params)}, '
+                  f'only_in_optim={len(only_optim)}, only_in_model={len(only_model)}')
+
+            # 2. Check which params have grads right now (after step+zero_grad, expect 0)
+            grads_set = sum(1 for g in optimizer.param_groups for p in g['params'] if p.grad is not None)
+            grads_nonzero = sum(1 for g in optimizer.param_groups for p in g['params'] if p.grad is not None and p.grad.abs().sum() > 0)
+            print(f'[DIAG step={step}] after_step: grads_set={grads_set}, grads_nonzero={grads_nonzero}')
+
+            # 3. Check _grad_norm from optimizer
+            gn = getattr(optimizer, '_grad_norm', 'MISSING')
+            print(f'[DIAG step={step}] optimizer._grad_norm={gn}')
+
+            # 4. Check a few param details
+            for gi, g in enumerate(optimizer.param_groups[:2]):
+                for pi, p in enumerate(g['params'][:2]):
+                    oname = getattr(p, 'original_name', '<none>')
+                    print(f'[DIAG step={step}] group[{gi}].param[{pi}]: device={p.device}, dtype={p.dtype}, '
+                          f'requires_grad={p.requires_grad}, grad_is_none={p.grad is None}, name={oname}')
+        # ── End diagnostic ───────────────────────────────────────────
+
         if pbar is not None:
             postfix = {'loss': f'{loss:.4f}'}
             step_save = config.get('save_every_n_steps')
