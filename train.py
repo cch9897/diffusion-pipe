@@ -1056,9 +1056,13 @@ if __name__ == '__main__':
 
         if pbar is not None:
             postfix = {'loss': f'{loss:.4f}'}
-            save_every = config.get('save_every_n_steps')
-            if save_every:
-                postfix['save'] = f'{save_every - (step % save_every)}/{save_every}'
+            step_save = config.get('save_every_n_steps')
+            epoch_save = config.get('save_every_n_epochs')
+            if step_save:
+                postfix['save'] = f'{step_save - (step % step_save)}/{step_save}st'
+            elif epoch_save:
+                steps_to_epoch = steps_per_epoch - (step % steps_per_epoch)
+                postfix['save'] = f'{steps_to_epoch}s→ep'
             pbar.set_postfix(postfix)
 
         if step % 50 == 0:
