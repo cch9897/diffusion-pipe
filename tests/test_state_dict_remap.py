@@ -18,6 +18,8 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from models.cosmos_predict2 import (
+    CosmosPredict2Pipeline,
+    InitialLayer,
     _remap_state_dict_keys,
     _split_state_dict_keys,
 )
@@ -223,3 +225,48 @@ def test_split_idempotent():
     split_twice = _split_state_dict_keys(split_once.copy())
     for k in split_once:
         assert torch.equal(split_once[k], split_twice[k])
+
+
+# ── Anima timestep convention ────────────────────────────────────────
+
+def test_anima_defaults_match_comfy_flow_timesteps():
+    pipeline = object.__new__(CosmosPredict2Pipeline)
+    pipeline.name = 'anima'
+    pipeline.model_config = {}
+    pipeline._set_timestep_defaults()
+
+    assert pipeline.timestep_shift == 3.0
+    assert pipeline.timestep_multiplier == 1000.0
+
+
+def test_cosmos_predict2_keeps_normalized_timesteps():
+    pipeline = object.__new__(CosmosPredict2Pipeline)
+    pipeline.name = 'cosmos_predict2'
+    pipeline.model_config = {}
+    pipeline._set_timestep_defaults()
+
+    assert pipeline.timestep_shift is None
+    assert pipeline.timestep_multiplier == 1.0
+
+
+def test_initial_layer_scales_anima_timestep_before_embedding():
+    class StubTEmbedder(torch.nn.Module):
+        def forward(self, timesteps):
+            return timesteps, timesteps + 1
+
+    class StubNorm(torch.nn.Module):
+        def forward(self, x):
+            return x
+
+    model = torch.nn.Module()
+    model.extra_per_block_abs_pos_emb = False
+    model.x_embedder = torch.nn.Identity()
+    model.pos_embedder = torch.nn.Identity()
+    model.t_embedder = StubTEmbedder()
+    model.t_embedding_norm = StubNorm()
+    model.timestep_multiplier = 1000.0
+
+    layer = InitialLayer(model, None, False, False)
+    timesteps = torch.tensor([0.25, 0.5])
+
+    assert torch.equal(layer._scale_timesteps(timesteps), torch.tensor([[250.0], [500.0]]))

@@ -664,6 +664,21 @@ class CosmosPredict2Pipeline(BasePipeline):
 
         self.text_encoder.requires_grad_(False)
 
+        self._set_timestep_defaults()
+
+    def _set_timestep_defaults(self):
+        # ComfyUI registers Anima as a standard FLOW model, not FLOW_COSMOS:
+        # it samples with shift=3 and feeds sigma*1000 into the timestep
+        # embedding. Cosmos-Predict2 keeps normalized timesteps in [0, 1].
+        # Preserve explicit config overrides, but make the Anima default match
+        # the checkpoint's inference/training convention.
+        if self.name == 'anima':
+            self.timestep_shift = self.model_config.get('shift', 3.0)
+            self.timestep_multiplier = self.model_config.get('timestep_multiplier', 1000.0)
+        else:
+            self.timestep_shift = self.model_config.get('shift', None)
+            self.timestep_multiplier = self.model_config.get('timestep_multiplier', 1.0)
+
     def load_diffusion_model(self):
         dtype = self.model_config['dtype']
         transformer_dtype = self.model_config.get('transformer_dtype', dtype)
@@ -700,6 +715,7 @@ class CosmosPredict2Pipeline(BasePipeline):
 
         with init_empty_weights():
             transformer = MiniTrainDIT(**dit_config)
+            transformer.timestep_multiplier = self.timestep_multiplier
             for name, p in transformer.named_parameters():
                 if name not in state_dict:
                     continue
@@ -828,8 +844,8 @@ class CosmosPredict2Pipeline(BasePipeline):
             t = t * sigmoid_scale
             t = torch.sigmoid(t)
 
-        if shift := self.model_config.get('shift', None):
-            t = (t * shift) / (1 + (shift - 1) * t)
+        if self.timestep_shift is not None:
+            t = (t * self.timestep_shift) / (1 + (self.timestep_shift - 1) * t)
         elif self.model_config.get('flux_shift', False):
             mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
             t = time_shift(mu, 1.0, t)
@@ -1028,6 +1044,14 @@ class InitialLayer(nn.Module):
         self.model = [model]
         self.is_generic_llm = is_generic_llm
         self.llm_adapter_trainable = llm_adapter_trainable
+        self.timestep_multiplier = getattr(model, 'timestep_multiplier', 1.0)
+
+    def _scale_timesteps(self, timesteps_B_T):
+        if timesteps_B_T.ndim == 1:
+            timesteps_B_T = timesteps_B_T.unsqueeze(1)
+        if self.timestep_multiplier != 1.0:
+            timesteps_B_T = timesteps_B_T * self.timestep_multiplier
+        return timesteps_B_T
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
@@ -1052,8 +1076,7 @@ class InitialLayer(nn.Module):
         # doesn't repeat the float32->bf16 cast 112 times/step (28 blocks × 2 tensors × 2).
         rope_emb_L_1_1_D = rope_emb_L_1_1_D.to(AUTOCAST_DTYPE)
 
-        if timesteps_B_T.ndim == 1:
-            timesteps_B_T = timesteps_B_T.unsqueeze(1)
+        timesteps_B_T = self._scale_timesteps(timesteps_B_T)
         t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
         t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
 

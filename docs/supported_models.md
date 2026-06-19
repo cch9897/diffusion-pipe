@@ -568,6 +568,7 @@ Notes:
 - You can control the llm_adapter learning rate separately. This is an adapter that processes the Qwen3 embeddings before feeding into the diffusion model.
   - Setting `llm_adapter_lr=0` disables training it entirely. This probably makes training more stable for small datasets.
   - If you have a larger dataset or a lot of brand-new concepts, you can try training the llm_adapter and see if it helps.
+- Anima defaults to ComfyUI FLOW timesteps in training: `shift=3` and `timestep_multiplier=1000`. Override `shift` or `timestep_multiplier` only if you are intentionally training a checkpoint with different timestep conditioning.
 - `torch_compile = true` enables per-block `torch.compile`. Hard incompatibilities (raise `ValueError`):
   - `activation_checkpointing = 'unsloth'` wraps the block forward in `@torch._disable_dynamo`, so compile cannot run. Use `activation_checkpointing = true` (native) instead.
   - `blocks_to_swap > 0` mutates `module.weight.data` on every step, which invalidates dynamo guards and triggers recompiles.
