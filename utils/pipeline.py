@@ -14,15 +14,16 @@ class ManualPipelineModule(PipelineModule):
         self.manual_partition_split = manual_partition_split
         # Workaround PyTorch 2.12: Module.to() no longer supports meta→device.
         # DeepSpeed PipelineModule.__init__ calls self.to(device) on meta-param layers.
-        # Catch the NotImplementedError and retry with to_empty().
-        # Note: to_empty() requires keyword-only 'device', but DeepSpeed passes it
-        # positionally (self.to("cuda:0")). Extract and remap accordingly.
+        # If ANY parameter is still meta (not loaded from checkpoint), Module.to()
+        # raises NotImplementedError. The old workaround called to_empty(), which
+        # replaces ALL parameters with uninitialized (zeroed) CUDA tensors — silently
+        # destroying checkpoint values and producing all-zero gradients.
+        # Fix: materialize only the meta tensors, preserving loaded parameters.
         _original_to = nn.Module.to
         def _to_empty_fallback(module, *to_args, **to_kwargs):
             try:
                 return _original_to(module, *to_args, **to_kwargs)
             except NotImplementedError:
-                # to_empty(device=...) is keyword-only; DeepSpeed calls to() positionally
                 device = to_kwargs.pop('device', None)
                 if device is None and to_args:
                     arg0 = to_args[0]
@@ -30,7 +31,34 @@ class ManualPipelineModule(PipelineModule):
                         device = arg0
                     elif hasattr(arg0, 'device'):  # e.g. a tensor
                         device = arg0.device
-                return module.to_empty(device=device, **to_kwargs)
+
+                # Count meta tensors and materialize them individually.
+                n_meta = 0
+                meta_names = []
+                for name, p in module.named_parameters(recurse=True):
+                    if p.is_meta:
+                        n_meta += 1
+                        if len(meta_names) < 10:
+                            meta_names.append(name)
+
+                if n_meta > 0:
+                    print(f'[WARNING] {n_meta} parameters were not loaded from checkpoint '
+                          f'(remained as meta tensors). They will be zero-initialized. '
+                          f'Examples: {meta_names}', flush=True)
+
+                    # Materialize meta tensors to real zero tensors on the target device,
+                    # while moving non-meta tensors normally. Using _apply ensures all
+                    # tensors (params + buffers) are handled.
+                    def _convert(t):
+                        if t.is_meta:
+                            return torch.zeros(t.shape, dtype=t.dtype, device=device)
+                        return t.to(device)
+                    module._apply(_convert)
+                    return module
+                else:
+                    # No meta tensors found — the NotImplementedError came from
+                    # something else. Fall back to to_empty as before.
+                    return module.to_empty(device=device, **to_kwargs)
         nn.Module.to = _to_empty_fallback
         try:
             super().__init__(*args, **kwargs)

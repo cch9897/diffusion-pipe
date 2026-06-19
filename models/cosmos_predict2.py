@@ -737,6 +737,20 @@ class CosmosPredict2Pipeline(BasePipeline):
         for name, p in self.transformer.named_parameters():
             p.original_name = name
 
+        # Diagnostic: detect parameters that were not loaded from checkpoint
+        # (still meta tensors). These would trigger the to_empty fallback in
+        # ManualPipelineModule, which silently zeroes ALL parameters.
+        if is_main_process():
+            meta_names = [name for name, p in transformer.named_parameters() if p.is_meta]
+            if meta_names:
+                print(f'[WARNING] {len(meta_names)} parameters not found in checkpoint '
+                      f'(remain as meta tensors). First 10: {meta_names[:10]}', flush=True)
+            else:
+                # Verify a few key parameters have nonzero values (not zeroed by to_empty)
+                _check = next(iter(transformer.parameters()))
+                print(f'[INFO] Model loaded: {sum(p.numel() for p in transformer.parameters())} params, '
+                      f'sample param norm={_check.data.float().norm().item():.4f}', flush=True)
+
     def get_vae(self):
         return self.vae.model
 

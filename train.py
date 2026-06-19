@@ -1040,95 +1040,6 @@ if __name__ == '__main__':
     else:
         pbar = None
 
-    # ── Gradient diagnostic: hooks to trace grad flow (remove after debugging) ──
-    # PipelineEngine dispatches via class-level _INSTRUCTION_MAP, not instance attrs.
-    # Must shadow the map on the instance so `self._INSTRUCTION_MAP` finds our version.
-    if is_main_process():
-        import torch as _torch
-        from types import MethodType
-        import deepspeed.runtime.pipe.schedule as _sched
-        import sys
-
-        # 1. Detect torch.compile on blocks + offloader
-        for _i, _layer in enumerate(model_engine.module.forward_funcs):
-            _lname = type(_layer).__name__
-            if hasattr(_layer, 'block'):
-                _compiled = hasattr(_layer.block.forward, '_torchdynamo_orig_callable')
-                print(f'[DIAG SETUP] Layer {_i} ({_lname}): block.forward compiled={_compiled}', flush=True)
-        _off = getattr(model_engine.module.forward_funcs[2], 'offloader', None) if len(model_engine.module.forward_funcs) > 2 else None
-        if _off:
-            print(f'[DIAG SETUP] offloader blocks_to_swap={_off.blocks_to_swap}', flush=True)
-
-        # 2. Shadow _INSTRUCTION_MAP on the instance with patched backward + reduce
-        _class_map = type(model_engine)._INSTRUCTION_MAP
-        _patched_map = dict(_class_map)
-        _orig_bwd_fn = _class_map[_sched.BackwardPass]
-        _orig_reduce_fn = _class_map[_sched.ReduceGrads]
-
-        _bwd_hook_fired = [False]
-        _diag_step = [0]  # counts reduce calls (= optimizer steps)
-
-        def _diag_bwd(self, buffer_id):
-            _bwd_hook_fired[0] = False
-            _loss = self.loss
-            if _loss is not None and _loss.grad_fn is not None and _diag_step[0] < 3:
-                def _loss_hook(grad):
-                    _bwd_hook_fired[0] = True
-                    print(f'[DIAG BWD] loss backward hook fired, grad_shape={grad.shape}, '
-                          f'grad_norm={grad.norm().item():.4e}', flush=True)
-                    return grad
-                _loss.register_hook(_loss_hook)
-            return _orig_bwd_fn(self, buffer_id)
-
-        def _diag_reduce(self):
-            _diag_step[0] += 1
-            s = _diag_step[0]
-            if s <= 3:
-                try:
-                    _torch.cuda.synchronize()
-                except RuntimeError as e:
-                    print(f'[DIAG PRE_REDUCE step={s}] *** CUDA ERROR after backward: {e}', flush=True)
-                    return _orig_reduce_fn(self)
-
-                if not _bwd_hook_fired[0]:
-                    print(f'[DIAG PRE_REDUCE step={s}] *** loss backward hook did NOT fire', flush=True)
-
-                n_train = 0; n_has = 0; n_nonzero = 0
-                sample_names_none = []; sample_names_zero = []; sample_names_ok = []
-                for _nm, _p in self.module.named_parameters():
-                    if not _p.requires_grad:
-                        continue
-                    n_train += 1
-                    if _p.grad is not None:
-                        n_has += 1
-                        if _p.grad.abs().max().item() > 0:
-                            n_nonzero += 1
-                            if len(sample_names_ok) < 3:
-                                sample_names_ok.append(f'{_nm}(norm={_p.grad.norm().item():.4e})')
-                        else:
-                            if len(sample_names_zero) < 3:
-                                sample_names_zero.append(_nm)
-                    else:
-                        if len(sample_names_none) < 5:
-                            sample_names_none.append(_nm)
-                print(f'[DIAG PRE_REDUCE step={s}] trainable={n_train}, has_grad={n_has}, nonzero_grad={n_nonzero}', flush=True)
-                if sample_names_none:
-                    print(f'  grad=None samples: {sample_names_none}', flush=True)
-                if sample_names_zero:
-                    print(f'  grad=zero samples: {sample_names_zero}', flush=True)
-                if sample_names_ok:
-                    print(f'  grad=OK samples: {sample_names_ok}', flush=True)
-                _loss = self.loss
-                if _loss is not None:
-                    print(f'  loss: val={_loss.item():.6f}, requires_grad={_loss.requires_grad}, '
-                          f'grad_fn={type(_loss.grad_fn).__name__ if _loss.grad_fn else None}', flush=True)
-            return _orig_reduce_fn(self)
-
-        _patched_map[_sched.BackwardPass] = _diag_bwd
-        _patched_map[_sched.ReduceGrads] = _diag_reduce
-        model_engine._INSTRUCTION_MAP = _patched_map
-        print('[DIAG SETUP] Instruction map patched OK', flush=True)
-
     while True:
         model_engine.reset_activation_shape()
         # Wait for the prefetch to complete (should be ready by now since GPU was busy)
@@ -1142,8 +1053,6 @@ if __name__ == '__main__':
         epoch_loss += loss
         num_steps += 1
         train_dataloader.sync_epoch()
-
-
 
         if pbar is not None:
             postfix = {'loss': f'{loss:.4f}'}
