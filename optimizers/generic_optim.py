@@ -376,22 +376,6 @@ class GenericOptim(Optimizer):
         skipped_parameter_names = []
         total_norm = 0
 
-        # ── Gradient diagnostic (remove after debugging) ──────────────
-        if not hasattr(self, '_diag_count'):
-            self._diag_count = 0
-        self._diag_count += 1
-        if self._diag_count <= 3:
-            n_total = sum(len(g['params']) for g in self.param_groups)
-            n_grad = sum(1 for g in self.param_groups for p in g['params'] if p.grad is not None)
-            n_none = n_total - n_grad
-            print(f'[OPTIM DIAG step={self._diag_count}] n_params={n_total}, has_grad={n_grad}, grad_none={n_none}')
-            if n_grad == 0 and n_total > 0:
-                # Show first few params to help identify the issue
-                for gi, g in enumerate(self.param_groups[:3]):
-                    for pi, p in enumerate(g['params'][:2]):
-                        print(f'  group[{gi}].param[{pi}]: id={id(p)}, device={p.device}, '
-                              f'requires_grad={p.requires_grad}, name={getattr(p, "original_name", "??")}')
-        # ── End diagnostic ───────────────────────────────────────────
 
         for group in self.param_groups:
             for p in group["params"]:

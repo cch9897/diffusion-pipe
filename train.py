@@ -1040,6 +1040,86 @@ if __name__ == '__main__':
     else:
         pbar = None
 
+    # ── Gradient diagnostic: hooks to trace grad flow (remove after debugging) ──
+    if is_main_process():
+        import torch as _torch
+        # 1. Detect torch.compile on blocks
+        for _i, _layer in enumerate(model_engine.module.forward_funcs):
+            _lname = type(_layer).__name__
+            if hasattr(_layer, 'block'):
+                _compiled = hasattr(_layer.block.forward, '_torchdynamo_orig_callable')
+                print(f'[DIAG SETUP] Layer {_i} ({_lname}): block.forward compiled={_compiled}')
+        # offloader status
+        _off = getattr(model_engine.module.forward_funcs[2], 'offloader', None) if len(model_engine.module.forward_funcs) > 2 else None
+        if _off:
+            print(f'[DIAG SETUP] offloader blocks_to_swap={_off.blocks_to_swap}')
+
+        # 2. Monkey-patch _exec_backward_pass to add a backward hook on the loss
+        _orig_bwd = model_engine._exec_backward_pass
+        _bwd_hook_fired = [False]
+        def _diag_backward_pass(buffer_id):
+            _bwd_hook_fired[0] = False
+            _loss = model_engine.loss
+            if _loss is not None and _loss.grad_fn is not None and _bwd_diag_step[0] < 3:
+                def _loss_hook(grad):
+                    _bwd_hook_fired[0] = True
+                    print(f'[DIAG BWD] loss.backward hook fired, grad_shape={grad.shape}, grad_norm={grad.norm().item():.4e}')
+                    return grad
+                _loss.register_hook(_loss_hook)
+            _orig_bwd(buffer_id)
+        model_engine._exec_backward_pass = _diag_backward_pass
+
+        # 3. Monkey-patch _exec_reduce_grads: inspect grads AFTER backward, BEFORE reduction fills zeros
+        _orig_reduce = model_engine._exec_reduce_grads
+        _bwd_diag_step = [0]
+        def _diag_reduce_grads():
+            _bwd_diag_step[0] += 1
+            s = _bwd_diag_step[0]
+            if s <= 3:
+                # Catch async CUDA errors from backward
+                try:
+                    _torch.cuda.synchronize()
+                except RuntimeError as e:
+                    print(f'[DIAG PRE_REDUCE step={s}] *** CUDA ERROR after backward: {e}')
+                    _orig_reduce()
+                    return
+
+                if not _bwd_hook_fired[0]:
+                    print(f'[DIAG PRE_REDUCE step={s}] *** loss backward hook did NOT fire — backward may not have run')
+
+                n_train = 0; n_has = 0; n_nonzero = 0
+                sample_names_none = []; sample_names_zero = []; sample_names_ok = []
+                for _nm, _p in model_engine.module.named_parameters():
+                    if not _p.requires_grad:
+                        continue
+                    n_train += 1
+                    if _p.grad is not None:
+                        n_has += 1
+                        if _p.grad.abs().max().item() > 0:
+                            n_nonzero += 1
+                            if len(sample_names_ok) < 3:
+                                sample_names_ok.append(f'{_nm}(norm={_p.grad.norm().item():.4e})')
+                        else:
+                            if len(sample_names_zero) < 3:
+                                sample_names_zero.append(_nm)
+                    else:
+                        if len(sample_names_none) < 5:
+                            sample_names_none.append(_nm)
+                print(f'[DIAG PRE_REDUCE step={s}] trainable={n_train}, has_grad={n_has}, nonzero_grad={n_nonzero}')
+                if sample_names_none:
+                    print(f'  grad=None samples: {sample_names_none}')
+                if sample_names_zero:
+                    print(f'  grad=zero samples: {sample_names_zero}')
+                if sample_names_ok:
+                    print(f'  grad=OK samples: {sample_names_ok}')
+                # Check the loss tensor
+                _loss = model_engine.loss
+                if _loss is not None:
+                    print(f'  loss: val={_loss.item():.6f}, requires_grad={_loss.requires_grad}, '
+                          f'grad_fn={type(_loss.grad_fn).__name__ if _loss.grad_fn else None}')
+            _orig_reduce()
+        model_engine._exec_reduce_grads = _diag_reduce_grads
+
     while True:
         model_engine.reset_activation_shape()
         # Wait for the prefetch to complete (should be ready by now since GPU was busy)
@@ -1054,32 +1134,7 @@ if __name__ == '__main__':
         num_steps += 1
         train_dataloader.sync_epoch()
 
-        # ── Gradient diagnostic (remove after debugging) ──────────────
-        if step <= 3 and is_main_process():
-            # 1. Check optimizer param identity vs pipeline model params
-            optim_params = {id(p) for g in optimizer.param_groups for p in g['params']}
-            model_params = {id(p) for p in model_engine.module.parameters() if p.requires_grad}
-            only_optim = optim_params - model_params
-            only_model = model_params - optim_params
-            print(f'[DIAG step={step}] optim_params={len(optim_params)}, model_params(requires_grad)={len(model_params)}, '
-                  f'only_in_optim={len(only_optim)}, only_in_model={len(only_model)}')
 
-            # 2. Check which params have grads right now (after step+zero_grad, expect 0)
-            grads_set = sum(1 for g in optimizer.param_groups for p in g['params'] if p.grad is not None)
-            grads_nonzero = sum(1 for g in optimizer.param_groups for p in g['params'] if p.grad is not None and p.grad.abs().sum() > 0)
-            print(f'[DIAG step={step}] after_step: grads_set={grads_set}, grads_nonzero={grads_nonzero}')
-
-            # 3. Check _grad_norm from optimizer
-            gn = getattr(optimizer, '_grad_norm', 'MISSING')
-            print(f'[DIAG step={step}] optimizer._grad_norm={gn}')
-
-            # 4. Check a few param details
-            for gi, g in enumerate(optimizer.param_groups[:2]):
-                for pi, p in enumerate(g['params'][:2]):
-                    oname = getattr(p, 'original_name', '<none>')
-                    print(f'[DIAG step={step}] group[{gi}].param[{pi}]: device={p.device}, dtype={p.dtype}, '
-                          f'requires_grad={p.requires_grad}, grad_is_none={p.grad is None}, name={oname}')
-        # ── End diagnostic ───────────────────────────────────────────
 
         if pbar is not None:
             postfix = {'loss': f'{loss:.4f}'}

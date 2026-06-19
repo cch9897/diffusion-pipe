@@ -20,6 +20,7 @@ import torch.nn as nn
 _swap_stream = None
 
 
+
 def clean_memory_on_device(device: torch.device):
     r"""
     Clean memory on the specified device, will be called from training scripts.
