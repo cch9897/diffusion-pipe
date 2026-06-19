@@ -459,48 +459,58 @@ class GenericOptim(Optimizer):
                 if automagic_lr is not None:
                     numerator.mul_(automagic_lr)
 
-                update = torch.zeros_like(p)
+                # Compute update in fp32 to avoid bf16 quantization underflow.
+                # With lr ~ 1e-6 and params at ~1.0, bf16 epsilon 0.0078
+                # causes per-step updates to be zero. fp32 accumulation fixes this.
+                update = torch.zeros_like(p, dtype=torch.float32)
+                numerator_f = numerator.float()
+                denominator_f = denominator.float() if denominator is not None else None
 
                 # step
-                if denominator is None:  # no adaptive step size
-                    update.add_(numerator, alpha=-step_size)
+                if denominator_f is None:  # no adaptive step size
+                    update.add_(numerator_f, alpha=-step_size)
                 elif self.second_moment_type in ('ema', 'factored'):  # standard adam
-                    update.addcdiv_(numerator, denominator, value=-step_size)
+                    update.addcdiv_(numerator_f, denominator_f, value=-step_size)
                 elif self.second_moment_type == "sn":  # subset norm requires broadcast division
                     if "subset_size" in group and group["subset_size"] != "heuristics":
-                        norm_grad = (numerator.view(state["subset_shape"]) / denominator).reshape(p.shape)
+                        norm_grad = (numerator_f.view(state["subset_shape"]) / denominator_f).reshape(p.shape)
                         update.add_(norm_grad, alpha=-step_size)
                     else:  # broadcast division is default for heuristics and non-subset-norm modules
-                        update.addcdiv_(numerator, denominator, value=-step_size)
+                        update.addcdiv_(numerator_f, denominator_f, value=-step_size)
                 else:
                     raise ValueError(f"Should not be here. Denominator is not None but second_moment_type "
                                      f"is {self.second_moment_type}")
 
                 # Add weight decay at the end (fixed version)
                 if group["weight_decay"] > 0.0:
-                    update.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
+                    update.add_(p.float(), alpha=(-group["lr"] * group["weight_decay"]))
 
                 synchronize |= using_cpu_offload
 
                 if p.dtype == torch.bfloat16:
-                    # In-place fused Kahan compensated summation for bfloat16.
-                    # Zero temporary allocations — arithmetic is hidden by memory bandwidth.
-                    # Uses the opposite-sign convention (shift holds -compensation),
-                    # bit-identical to Neumaier but without the 3-temp-tensor overhead.
+                    # In-place Kahan compensated summation for bfloat16.
+                    # Shift buffer is fp32 to avoid self-saturation:
+                    # when shift itself is bf16, sub-LSB updates accumulate
+                    # until shift ~0.0039 (bf16 eps 3.05e-5 > lr), then stall.
+                    # fp32 shift has no saturation point.
+                    # Algorithm (Neumaier sign convention, same as old code):
+                    #   shift += update                   (fp32: old_shift + this update)
+                    #   old_p = p  (save bf16 value)
+                    #   p += shift  (bf16-rounded)
+                    #   shift += old_p - p  (rounding error → new compensation)
                     if 'shift' not in state:
-                        state['shift'] = torch.zeros_like(p)
+                        state['shift'] = torch.zeros_like(p, dtype=torch.float32)
                     shift = state['shift'].to(p.device, non_blocking=True)
-                    shift.add_(update)                 # shift = comp + update
-                    # Reuse p.grad as temp buffer (grad already consumed into update
-                    # above). Avoids allocating a dedicated _temp tensor the size of p,
-                    # which costs 4 GB on a 2B-param model and causes OOM on 32 GB cards.
-                    p.grad.copy_(p.detach())           # reuse p.grad as temp buffer
-                    p.add_(shift)                      # bf16-rounded addition
-                    shift.add_(p.grad.sub_(p))         # recover rounding error: comp = -(rounding error)
-                    # TODO: non_blocking=True here causes CUDA error on first step after checkpoint save.
+                    shift.add_(update)                     # fp32: shift = comp + update
+                    p.grad.copy_(p.detach())               # reuse p.grad as bf16 old-p snapshot
+                    p.add_(shift.to(p.dtype))              # bf16-rounded addition
+                    # Recover rounding error in fp32: old_p - new_p = -(rounding error)
+                    # p.grad still holds old_p; sub_(p) gives old_p - new_p in bf16,
+                    # then cast to fp32 and add to shift.
+                    shift.add_(p.grad.sub_(p).float())     # fp32: shift += rounding error
                     state['shift'] = shift.to(kahan_buffer_device)
                 else:
-                    p.add_(update)
+                    p.add_(update.to(p.dtype))
 
         if synchronize:
             # Because we did non_blocking transfer in GPU -> CPU direction.
@@ -661,6 +671,11 @@ class GenericOptim(Optimizer):
                 for k, v in state.items():
                     if torch.is_tensor(v) and cpu_offload:
                         state[k] = v.to('cpu')
+                # Migrate old bf16 Kahan shift buffers to fp32 (P0 fix: bf16 shift self-saturates).
+                # Old checkpoints saved bf16 shifts; new code expects fp32.
+                # The shift value is preserved (cast to fp32) — no precision loss.
+                if 'shift' in state and state['shift'].dtype != torch.float32:
+                    state['shift'] = state['shift'].float()
                 # The projector is a class which contains tensors, so state needs to be explicitly moved to the correct device.
                 if 'projector' in state:
                     state['projector'].to(p.device)
