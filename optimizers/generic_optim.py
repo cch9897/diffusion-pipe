@@ -460,41 +460,17 @@ class GenericOptim(Optimizer):
                 if automagic_lr is not None:
                     numerator.mul_(automagic_lr)
 
-                # Compute update in fp32 to avoid bf16 quantization underflow.
-                # With lr ~ 1e-6 and params at ~1.0, bf16 epsilon 0.0078
-                # causes per-step updates to be zero. fp32 accumulation fixes this.
-                update = torch.zeros_like(p, dtype=torch.float32)
-                numerator_f = numerator.float()
-                denominator_f = denominator.float() if denominator is not None else None
-
-                # step
-                if denominator_f is None:  # no adaptive step size
-                    update.add_(numerator_f, alpha=-step_size)
-                elif self.second_moment_type in ('ema', 'factored'):  # standard adam
-                    update.addcdiv_(numerator_f, denominator_f, value=-step_size)
-                elif self.second_moment_type == "sn":  # subset norm requires broadcast division
-                    if "subset_size" in group and group["subset_size"] != "heuristics":
-                        norm_grad = (numerator_f.view(state["subset_shape"]) / denominator_f).reshape(p.shape)
-                        update.add_(norm_grad, alpha=-step_size)
-                    else:  # broadcast division is default for heuristics and non-subset-norm modules
-                        update.addcdiv_(numerator_f, denominator_f, value=-step_size)
-                else:
-                    raise ValueError(f"Should not be here. Denominator is not None but second_moment_type "
-                                     f"is {self.second_moment_type}")
-
-                # Add weight decay at the end (fixed version)
-                if group["weight_decay"] > 0.0:
-                    update.add_(p.float(), alpha=(-group["lr"] * group["weight_decay"]))
-
-                synchronize |= using_cpu_offload
-
+                # For bf16 params, compute the update directly into the fp32 shift
+                # buffer to avoid allocating a separate fp32 tensor the size of p
+                # (which costs ~9 GB on a 2.35B-param model and causes OOM on 32 GB
+                # cards). For non-bf16 params, fall back to the simple in-place path.
                 if p.dtype == torch.bfloat16:
-                    # In-place Kahan compensated summation for bfloat16.
+                    # Kahan compensated summation for bfloat16.
                     # Shift buffer is fp32 to avoid self-saturation:
                     # when shift itself is bf16, sub-LSB updates accumulate
                     # until shift ~0.0039 (bf16 eps 3.05e-5 > lr), then stall.
                     # fp32 shift has no saturation point.
-                    # Algorithm (Neumaier sign convention, same as old code):
+                    # Algorithm (Neumaier sign convention):
                     #   shift += update                   (fp32: old_shift + this update)
                     #   old_p = p  (save bf16 value)
                     #   p += shift  (bf16-rounded)
@@ -502,15 +478,66 @@ class GenericOptim(Optimizer):
                     if 'shift' not in state:
                         state['shift'] = torch.zeros_like(p, dtype=torch.float32)
                     shift = state['shift'].to(p.device, non_blocking=True)
-                    shift.add_(update)                     # fp32: shift = comp + update
+
+                    # Compute update in fp32 directly into shift (shift += update).
+                    # We reuse shift as the accumulator, avoiding a separate fp32 allocation.
+                    numerator_f = numerator.float()
+                    denominator_f = denominator.float() if denominator is not None else None
+
+                    # shift acts as the update tensor: shift = -step_size * numerator / denominator
+                    if denominator_f is None:  # no adaptive step size
+                        shift.add_(numerator_f, alpha=-step_size)
+                    elif self.second_moment_type in ('ema', 'factored'):  # standard adam
+                        shift.addcdiv_(numerator_f, denominator_f, value=-step_size)
+                    elif self.second_moment_type == "sn":  # subset norm
+                        if "subset_size" in group and group["subset_size"] != "heuristics":
+                            norm_grad = (numerator_f.view(state["subset_shape"]) / denominator_f).reshape(p.shape)
+                            shift.add_(norm_grad, alpha=-step_size)
+                        else:
+                            shift.addcdiv_(numerator_f, denominator_f, value=-step_size)
+                    else:
+                        raise ValueError(f"Should not be here. Denominator is not None but second_moment_type "
+                                         f"is {self.second_moment_type}")
+
+                    # Add weight decay
+                    if group["weight_decay"] > 0.0:
+                        shift.add_(p.float(), alpha=(-group["lr"] * group["weight_decay"]))
+
+                    using_cpu_offload = (self.cpu_offload or self.kahan_buffer_offload) if p.ndim >= 2 else False
+                    synchronize |= using_cpu_offload
+
+                    # Now shift holds the full update. Apply Kahan:
+                    # p_old = p (save via p.grad reuse), p += shift, recover rounding error.
                     p.grad.copy_(p.detach())               # reuse p.grad as bf16 old-p snapshot
                     p.add_(shift.to(p.dtype))              # bf16-rounded addition
                     # Recover rounding error in fp32: old_p - new_p = -(rounding error)
-                    # p.grad still holds old_p; sub_(p) gives old_p - new_p in bf16,
-                    # then cast to fp32 and add to shift.
                     shift.add_(p.grad.sub_(p).float())     # fp32: shift += rounding error
                     state['shift'] = shift.to(kahan_buffer_device)
                 else:
+                    # Non-bf16 path: simple in-place update, no Kahan needed.
+                    update = torch.zeros_like(p, dtype=torch.float32)
+                    numerator_f = numerator.float()
+                    denominator_f = denominator.float() if denominator is not None else None
+
+                    if denominator_f is None:
+                        update.add_(numerator_f, alpha=-step_size)
+                    elif self.second_moment_type in ('ema', 'factored'):
+                        update.addcdiv_(numerator_f, denominator_f, value=-step_size)
+                    elif self.second_moment_type == "sn":
+                        if "subset_size" in group and group["subset_size"] != "heuristics":
+                            norm_grad = (numerator_f.view(state["subset_shape"]) / denominator_f).reshape(p.shape)
+                            update.add_(norm_grad, alpha=-step_size)
+                        else:
+                            update.addcdiv_(numerator_f, denominator_f, value=-step_size)
+                    else:
+                        raise ValueError(f"Should not be here.")
+
+                    if group["weight_decay"] > 0.0:
+                        update.add_(p.float(), alpha=(-group["lr"] * group["weight_decay"]))
+
+                    using_cpu_offload = (self.cpu_offload or self.kahan_buffer_offload) if p.ndim >= 2 else False
+                    synchronize |= using_cpu_offload
+
                     p.add_(update.to(p.dtype))
 
         if synchronize:
