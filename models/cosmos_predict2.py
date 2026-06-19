@@ -667,14 +667,14 @@ class CosmosPredict2Pipeline(BasePipeline):
         self._set_timestep_defaults()
 
     def _set_timestep_defaults(self):
-        # ComfyUI registers Anima as a standard FLOW model, not FLOW_COSMOS:
-        # it samples with shift=3 and feeds sigma*1000 into the timestep
-        # embedding. Cosmos-Predict2 keeps normalized timesteps in [0, 1].
-        # Preserve explicit config overrides, but make the Anima default match
-        # the checkpoint's inference/training convention.
+        # Anima uses the same normalised timestep convention as Cosmos-Predict2:
+        # t ∈ [0, 1] with shift=3.  ComfyUI's Anima config confirms this:
+        #   sampling_settings = {"multiplier": 1.0, "shift": 3.0}
+        # (ModelSamplingDiscreteFlow.timestep returns sigma * multiplier,
+        #  so multiplier=1.0 ⇒ t stays in [0, 1].)
         if self.name == 'anima':
             self.timestep_shift = self.model_config.get('shift', 3.0)
-            self.timestep_multiplier = self.model_config.get('timestep_multiplier', 1000.0)
+            self.timestep_multiplier = self.model_config.get('timestep_multiplier', 1.0)
         else:
             self.timestep_shift = self.model_config.get('shift', None)
             self.timestep_multiplier = self.model_config.get('timestep_multiplier', 1.0)

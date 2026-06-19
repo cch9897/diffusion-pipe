@@ -528,6 +528,7 @@ class GenericOptim(Optimizer):
         if self.mpu is not None:
             dist.all_reduce(total_norm_cuda, op=dist.ReduceOp.SUM, group=self.mpu.get_model_parallel_group())
         self._grad_norm = total_norm_cuda[0].item()**(0.5)
+        self._global_grad_norm = self._grad_norm  # DeepSpeed engine reads this at engine.py:2972
 
         return loss
 

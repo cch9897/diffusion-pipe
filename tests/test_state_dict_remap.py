@@ -230,13 +230,14 @@ def test_split_idempotent():
 # ── Anima timestep convention ────────────────────────────────────────
 
 def test_anima_defaults_match_comfy_flow_timesteps():
+    """Anima sampling_settings in ComfyUI: {"multiplier": 1.0, "shift": 3.0}."""
     pipeline = object.__new__(CosmosPredict2Pipeline)
     pipeline.name = 'anima'
     pipeline.model_config = {}
     pipeline._set_timestep_defaults()
 
     assert pipeline.timestep_shift == 3.0
-    assert pipeline.timestep_multiplier == 1000.0
+    assert pipeline.timestep_multiplier == 1.0
 
 
 def test_cosmos_predict2_keeps_normalized_timesteps():
@@ -264,9 +265,9 @@ def test_initial_layer_scales_anima_timestep_before_embedding():
     model.pos_embedder = torch.nn.Identity()
     model.t_embedder = StubTEmbedder()
     model.t_embedding_norm = StubNorm()
-    model.timestep_multiplier = 1000.0
+    model.timestep_multiplier = 1.0
 
     layer = InitialLayer(model, None, False, False)
     timesteps = torch.tensor([0.25, 0.5])
 
-    assert torch.equal(layer._scale_timesteps(timesteps), torch.tensor([[250.0], [500.0]]))
+    assert torch.equal(layer._scale_timesteps(timesteps), torch.tensor([[0.25], [0.50]]))
