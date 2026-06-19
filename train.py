@@ -1054,6 +1054,32 @@ if __name__ == '__main__':
         num_steps += 1
         train_dataloader.sync_epoch()
 
+        # Post-step diagnostic: detect NaN/Inf in parameters or grads after optimizer step.
+        # "device not ready" is an asynchronous CUDA error reported at a later sync point;
+        # the real cause may be NaN/Inf params from the optimizer step.
+        if step <= 5:
+            _n_nan = 0
+            _n_inf = 0
+            _sample_bad = []
+            for _nm, _p in model_engine.module.named_parameters():
+                if not _p.requires_grad:
+                    continue
+                if _p.data.isfloatingpoint():
+                    _has_nan = _p.data.isnan().any().item()
+                    _has_inf = _p.data.isinf().any().item()
+                    if _has_nan or _has_inf:
+                        _n_nan += int(_has_nan)
+                        _n_inf += int(_has_inf)
+                        if len(_sample_bad) < 5:
+                            _sample_bad.append(f'{_nm}(nan={_has_nan},inf={_has_inf})')
+            if _n_nan > 0 or _n_inf > 0:
+                print(f'[POST-STEP {step}] WARNING: {_n_nan} NaN + {_n_inf} Inf params after optimizer step! '
+                      f'Samples: {_sample_bad}', flush=True)
+            else:
+                _alloc, _reserved = torch.cuda.memory_allocated() / 1e9, torch.cuda.max_memory_allocated() / 1e9
+                print(f'[POST-STEP {step}] OK, loss={loss:.4f}, '
+                      f'VRAM alloc={_alloc:.1f}GB peak={_reserved:.1f}GB', flush=True)
+
         if pbar is not None:
             postfix = {'loss': f'{loss:.4f}'}
             step_save = config.get('save_every_n_steps')
