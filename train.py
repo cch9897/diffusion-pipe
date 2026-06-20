@@ -1062,6 +1062,7 @@ if __name__ == '__main__':
 
         if _profile:
             _step_end.record()
+            _step_end.synchronize()
             _total_ms = _step_start.elapsed_time(_step_end)
             if step <= 10 or step % 50 == 0:
                 print(f'[PROF] total step {step}: {_total_ms:.0f}ms', flush=True)

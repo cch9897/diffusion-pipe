@@ -568,6 +568,7 @@ class GenericOptim(Optimizer):
 
         if _opt_profile:
             self._prof_end.record()
+            self._prof_end.synchronize()
             _opt_ms = self._prof_start.elapsed_time(self._prof_end)
             if not hasattr(self, '_prof_count'):
                 self._prof_count = 0
