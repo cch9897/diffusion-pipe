@@ -1061,6 +1061,33 @@ if __name__ == '__main__':
         _total_ms = _step_start.elapsed_time(_step_end)
         if step <= 10 or step % 50 == 0:
             print(f'[PROF] total step {step}: {_total_ms:.0f}ms', flush=True)
+
+        # One-shot detailed profiler on step 6 (steady state)
+        if step == 6:
+            print('[PROF] Starting detailed profiler on step 7...', flush=True)
+            torch.cuda.synchronize()
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+            ) as prof:
+                model_engine.reset_activation_shape()
+                if _prefetch_future is not None:
+                    iterator = _prefetch_future.result()
+                else:
+                    iterator = get_data_iterator_for_step(train_dataloader, model_engine)
+                _prefetch_future = _prefetch_next()
+                loss = model_engine.train_batch(iterator).item()
+                torch.cuda.synchronize()
+
+            print('[PROF] === Top 30 CUDA operators (by CUDA time) ===', flush=True)
+            print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=30), flush=True)
+            print('[PROF] === Top 15 CPU operators (by CPU time) ===', flush=True)
+            print(prof.key_averages().table(sort_by='cpu_time_total', row_limit=15), flush=True)
+            # Also save chrome trace for deeper analysis
+            prof.export_chrome_trace('/tmp/dp_trace_step7.json')
+            print('[PROF] Chrome trace saved to /tmp/dp_trace_step7.json', flush=True)
         epoch_loss += loss
         num_steps += 1
         train_dataloader.sync_epoch()
