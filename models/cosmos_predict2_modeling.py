@@ -988,6 +988,12 @@ class FinalLayer(nn.Module):
 
 
 def _zero_adaln_modulation_2_offdiag_grad(grad: torch.Tensor, x_dim: int, adaln_lora_dim: int) -> torch.Tensor:
+    """Zero off-diagonal blocks of AdaLN modulation-2 grad (block-diagonal constraint).
+
+    Kept as a module-level function for serializability (pickle-safe).
+    Prefer the closure-based version in register_adaln_modulation_2_grad_hook()
+    which precomputes slice specs to avoid repeated arithmetic in the hot path.
+    """
     for row_branch in range(3):
         row_start = row_branch * 3 * x_dim
         row_end = row_start + 3 * x_dim
@@ -996,7 +1002,7 @@ def _zero_adaln_modulation_2_offdiag_grad(grad: torch.Tensor, x_dim: int, adaln_
                 continue
             col_start = col_branch * adaln_lora_dim
             col_end = col_start + adaln_lora_dim
-            grad[row_start:row_end, col_start:col_end].zero_()
+            grad[row_start:row_end, col_start:col_end] = 0
     return grad
 
 class Block(nn.Module):
@@ -1069,9 +1075,19 @@ class Block(nn.Module):
     def register_adaln_modulation_2_grad_hook(self) -> None:
         if not self.use_adaln_lora or self._adaln_modulation_2_grad_hook is not None:
             return
-        self._adaln_modulation_2_grad_hook = self.adaln_modulation_2.weight.register_hook(
-            lambda grad: _zero_adaln_modulation_2_offdiag_grad(grad, self.x_dim, self.adaln_lora_dim)
-        )
+        # Precompute slice specs to avoid Python arithmetic in the hot backward path.
+        x_dim = self.x_dim
+        ald = self.adaln_lora_dim
+        off_diag_slices = [
+            (rb * 3 * x_dim, (rb + 1) * 3 * x_dim,
+             cb * ald, (cb + 1) * ald)
+            for rb in range(3) for cb in range(3) if rb != cb
+        ]
+        def _zero_offdiag(grad):
+            for rs, re, cs, ce in off_diag_slices:
+                grad[rs:re, cs:ce] = 0
+            return grad
+        self._adaln_modulation_2_grad_hook = self.adaln_modulation_2.weight.register_hook(_zero_offdiag)
 
     def reset_parameters(self) -> None:
         self.layer_norm_self_attn.reset_parameters()

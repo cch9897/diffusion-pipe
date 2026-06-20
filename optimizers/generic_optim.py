@@ -5,6 +5,7 @@
 
 from typing import Callable, Iterable, Tuple
 import math
+import os
 from .projectors.svd_projector import SVDProjector
 from .projectors.uniform_projector import UniformProjector  # get random subset
 from .projectors.topk_norm_projector import TopKNormProjector  # topk indices
@@ -309,6 +310,7 @@ class GenericOptim(Optimizer):
             correct_dim=False,
             cpu_offload=False,
             kahan_buffer_offload=False,
+            kahan_shift_dtype='bf16',
             muon=False,
             adamuon=False,
             normuon=False,
@@ -330,6 +332,9 @@ class GenericOptim(Optimizer):
         self.compile = compile
         self.cpu_offload = cpu_offload
         self.kahan_buffer_offload = kahan_buffer_offload
+        assert kahan_shift_dtype in ('bf16', 'fp32'), f'kahan_shift_dtype must be bf16 or fp32, got {kahan_shift_dtype}'
+        self.kahan_shift_dtype = kahan_shift_dtype
+        self.kahan_shift_torch_dtype = torch.float32 if kahan_shift_dtype == 'fp32' else torch.bfloat16
         self.mpu = mpu
 
         if polar_express:
@@ -357,7 +362,7 @@ class GenericOptim(Optimizer):
         # Print out all configurations
         print(f"GenericOptim Configuration: lr={lr}, betas={betas}, eps={eps}, weight_decay={weight_decay}, "
               f"correct_bias={correct_bias}, momentum_type={momentum_type}, second_moment_type={second_moment_type}, correct_dim={correct_dim}, "
-              f"cpu_offload={cpu_offload}, muon={muon}, adamuon={adamuon}, normuon={normuon}, compile={compile}, automagic={automagic}, min_lr={min_lr}, "
+              f"cpu_offload={cpu_offload}, kahan_shift_dtype={kahan_shift_dtype}, muon={muon}, adamuon={adamuon}, normuon={normuon}, compile={compile}, automagic={automagic}, min_lr={min_lr}, "
               f"max_lr={max_lr}, lr_bump={lr_bump}, lr_decrease_factor={lr_decrease_factor}")
 
     @torch.no_grad()
@@ -376,11 +381,13 @@ class GenericOptim(Optimizer):
         skipped_parameter_names = []
         total_norm = 0
 
-        # Profiling: CUDA event timing for optimizer step
-        if not hasattr(self, '_prof_start'):
-            self._prof_start = torch.cuda.Event(enable_timing=True)
-            self._prof_end = torch.cuda.Event(enable_timing=True)
-        self._prof_start.record()
+        # Profiling: CUDA event timing for optimizer step (gated by DP_PROFILE=1)
+        _opt_profile = os.environ.get('DP_PROFILE', '') == '1'
+        if _opt_profile:
+            if not hasattr(self, '_prof_start'):
+                self._prof_start = torch.cuda.Event(enable_timing=True)
+                self._prof_end = torch.cuda.Event(enable_timing=True)
+            self._prof_start.record()
 
         for group in self.param_groups:
             for p in group["params"]:
@@ -481,7 +488,7 @@ class GenericOptim(Optimizer):
                     #   p += shift  (bf16-rounded)
                     #   shift += old_p - p  (rounding error → new compensation)
                     if 'shift' not in state:
-                        state['shift'] = torch.zeros_like(p, dtype=torch.float32)
+                        state['shift'] = torch.zeros_like(p, dtype=self.kahan_shift_torch_dtype)
                     shift = state['shift'].to(p.device, non_blocking=True)
 
                     # Compute update directly into fp32 shift via PyTorch type promotion:
@@ -559,15 +566,14 @@ class GenericOptim(Optimizer):
         self._grad_norm = total_norm_cuda[0].item()**(0.5)
         self._global_grad_norm = self._grad_norm  # DeepSpeed engine reads this at engine.py:2972
 
-        # Profiling: record end event and print optimizer time
-        self._prof_end.record()
-        torch.cuda.synchronize()
-        _opt_ms = self._prof_start.elapsed_time(self._prof_end)
-        if not hasattr(self, '_prof_count'):
-            self._prof_count = 0
-        self._prof_count += 1
-        if self._prof_count <= 10 or self._prof_count % 50 == 0:
-            print(f'[PROF] optimizer.step #{self._prof_count}: {_opt_ms:.0f}ms', flush=True)
+        if _opt_profile:
+            self._prof_end.record()
+            _opt_ms = self._prof_start.elapsed_time(self._prof_end)
+            if not hasattr(self, '_prof_count'):
+                self._prof_count = 0
+            self._prof_count += 1
+            if self._prof_count <= 10 or self._prof_count % 50 == 0:
+                print(f'[PROF] optimizer.step #{self._prof_count}: {_opt_ms:.0f}ms', flush=True)
 
         return loss
 
@@ -714,8 +720,8 @@ class GenericOptim(Optimizer):
                 # Migrate old bf16 Kahan shift buffers to fp32 (P0 fix: bf16 shift self-saturates).
                 # Old checkpoints saved bf16 shifts; new code expects fp32.
                 # The shift value is preserved (cast to fp32) — no precision loss.
-                if 'shift' in state and state['shift'].dtype != torch.float32:
-                    state['shift'] = state['shift'].float()
+                if 'shift' in state and state['shift'].dtype != self.kahan_shift_torch_dtype:
+                    state['shift'] = state['shift'].to(self.kahan_shift_torch_dtype)
                 # The projector is a class which contains tensors, so state needs to be explicitly moved to the correct device.
                 if 'projector' in state:
                     state['projector'].to(p.device)
