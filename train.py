@@ -1107,9 +1107,6 @@ if __name__ == '__main__':
                 postfix['save'] = f'{steps_to_epoch}s→ep'
             pbar.set_postfix(postfix)
 
-        if step % 50 == 0:
-            empty_cuda_cache()
-
         new_epoch, checkpointed, saved = saver.process_epoch(epoch, step, examples)
         finished_epoch = True if new_epoch != epoch else False
 
@@ -1140,6 +1137,7 @@ if __name__ == '__main__':
                 tb_writer.add_scalar('train/epoch_loss', epoch_loss/num_steps, epoch)
                 if wandb_enable:
                     wandb.log({'train/epoch_loss': epoch_loss/num_steps, 'epoch': epoch})
+            empty_cuda_cache()
             epoch_loss = 0
             num_steps = 0
             if new_epoch is None:
