@@ -1041,6 +1041,11 @@ if __name__ == '__main__':
         pbar = None
 
     while True:
+        # Profiling: total step timing
+        _step_start = torch.cuda.Event(enable_timing=True)
+        _step_end = torch.cuda.Event(enable_timing=True)
+        _step_start.record()
+
         model_engine.reset_activation_shape()
         # Wait for the prefetch to complete (should be ready by now since GPU was busy)
         if _prefetch_future is not None:
@@ -1050,6 +1055,12 @@ if __name__ == '__main__':
         # Start prefetching the next step's data while GPU computes
         _prefetch_future = _prefetch_next()
         loss = model_engine.train_batch(iterator).item()
+
+        _step_end.record()
+        torch.cuda.synchronize()
+        _total_ms = _step_start.elapsed_time(_step_end)
+        if step <= 10 or step % 50 == 0:
+            print(f'[PROF] total step {step}: {_total_ms:.0f}ms', flush=True)
         epoch_loss += loss
         num_steps += 1
         train_dataloader.sync_epoch()

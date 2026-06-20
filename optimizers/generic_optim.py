@@ -376,6 +376,11 @@ class GenericOptim(Optimizer):
         skipped_parameter_names = []
         total_norm = 0
 
+        # Profiling: CUDA event timing for optimizer step
+        if not hasattr(self, '_prof_start'):
+            self._prof_start = torch.cuda.Event(enable_timing=True)
+            self._prof_end = torch.cuda.Event(enable_timing=True)
+        self._prof_start.record()
 
         for group in self.param_groups:
             for p in group["params"]:
@@ -553,6 +558,16 @@ class GenericOptim(Optimizer):
             dist.all_reduce(total_norm_cuda, op=dist.ReduceOp.SUM, group=self.mpu.get_model_parallel_group())
         self._grad_norm = total_norm_cuda[0].item()**(0.5)
         self._global_grad_norm = self._grad_norm  # DeepSpeed engine reads this at engine.py:2972
+
+        # Profiling: record end event and print optimizer time
+        self._prof_end.record()
+        torch.cuda.synchronize()
+        _opt_ms = self._prof_start.elapsed_time(self._prof_end)
+        if not hasattr(self, '_prof_count'):
+            self._prof_count = 0
+        self._prof_count += 1
+        if self._prof_count <= 10 or self._prof_count % 50 == 0:
+            print(f'[PROF] optimizer.step #{self._prof_count}: {_opt_ms:.0f}ms', flush=True)
 
         return loss
 
