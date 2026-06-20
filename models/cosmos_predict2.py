@@ -920,15 +920,7 @@ class CosmosPredict2Pipeline(BasePipeline):
         ]
         for i, block in enumerate(transformer.blocks):
             layers.append(TransformerLayer(block, i, self.offloader))
-        final_layer = FinalLayer(transformer)
-        if self.model_config.get('torch_compile', False):
-            final_layer.forward = torch.compile(
-                final_layer.forward,
-                mode=compile_mode,
-                fullgraph=False,
-                dynamic=compile_dynamic,
-            )
-        layers.append(final_layer)
+        layers.append(FinalLayer(transformer))
         return layers
 
     def enable_block_swap(self, blocks_to_swap):
