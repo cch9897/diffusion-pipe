@@ -31,7 +31,7 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
     @torch.amp.custom_fwd(device_type='cuda')
     def forward(ctx, forward_function, hidden_states, *args):
         if not hidden_states.is_pinned():
-            saved_hidden_states = torch.empty_like(hidden_states, pin_memory=True)
+            saved_hidden_states = torch.empty(hidden_states.shape, dtype=hidden_states.dtype, pin_memory=True)
             saved_hidden_states.copy_(hidden_states, non_blocking=True)
         else:
             saved_hidden_states = hidden_states.to('cpu', non_blocking=True)
