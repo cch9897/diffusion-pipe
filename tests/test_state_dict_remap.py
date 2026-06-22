@@ -17,12 +17,16 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from models.cosmos_predict2 import (
-    CosmosPredict2Pipeline,
-    InitialLayer,
-    _remap_state_dict_keys,
-    _split_state_dict_keys,
-)
+from models.cosmos_predict2_state_dict import _remap_state_dict_keys, _split_state_dict_keys
+
+try:
+    from models.cosmos_predict2 import CosmosPredict2Pipeline, InitialLayer
+    _HAS_PIPELINE = True
+except ImportError:
+    _HAS_PIPELINE = False
+    CosmosPredict2Pipeline = None  # type: ignore
+    InitialLayer = None  # type: ignore
+
 from models.cosmos_predict2_modeling import _zero_adaln_modulation_2_offdiag_grad
 
 
@@ -229,6 +233,7 @@ def test_split_idempotent():
 
 # ── Anima timestep convention ────────────────────────────────────────
 
+@pytest.mark.skipif(not _HAS_PIPELINE, reason="requires full ML stack (transformers, peft, accelerate, etc.)")
 def test_anima_defaults_match_comfy_flow_timesteps():
     """Anima sampling_settings in ComfyUI: {"multiplier": 1.0, "shift": 3.0}."""
     pipeline = object.__new__(CosmosPredict2Pipeline)
@@ -240,6 +245,7 @@ def test_anima_defaults_match_comfy_flow_timesteps():
     assert pipeline.timestep_multiplier == 1.0
 
 
+@pytest.mark.skipif(not _HAS_PIPELINE, reason="requires full ML stack (transformers, peft, accelerate, etc.)")
 def test_cosmos_predict2_keeps_normalized_timesteps():
     pipeline = object.__new__(CosmosPredict2Pipeline)
     pipeline.name = 'cosmos_predict2'
@@ -250,6 +256,7 @@ def test_cosmos_predict2_keeps_normalized_timesteps():
     assert pipeline.timestep_multiplier == 1.0
 
 
+@pytest.mark.skipif(not _HAS_PIPELINE, reason="requires full ML stack (transformers, peft, accelerate, etc.)")
 def test_initial_layer_scales_anima_timestep_before_embedding():
     class StubTEmbedder(torch.nn.Module):
         def forward(self, timesteps):
