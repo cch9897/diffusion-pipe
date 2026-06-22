@@ -568,7 +568,7 @@ Notes:
 - You can control the llm_adapter learning rate separately. This is an adapter that processes the Qwen3 embeddings before feeding into the diffusion model.
   - Setting `llm_adapter_lr=0` disables training it entirely. This probably makes training more stable for small datasets.
   - If you have a larger dataset or a lot of brand-new concepts, you can try training the llm_adapter and see if it helps.
-- Anima defaults to ComfyUI FLOW timesteps in training: `shift=3` and `timestep_multiplier=1000`. Override `shift` or `timestep_multiplier` only if you are intentionally training a checkpoint with different timestep conditioning.
+- Anima uses the same normalized timestep convention as Cosmos-Predict2: `t ∈ [0, 1]` with `shift=3` (default). The `timestep_multiplier` defaults to `1.0` (no scaling), compatible with the model's sinusoidal timestep embedding. Override `shift` or `timestep_multiplier` only if training a checkpoint with different timestep conditioning.
 - `torch_compile = true` enables per-block `torch.compile`. Hard incompatibilities (raise `ValueError`):
   - `activation_checkpointing = 'unsloth'` wraps the block forward in `@torch._disable_dynamo`, so compile cannot run. Use `activation_checkpointing = true` (native) instead.
   - `blocks_to_swap > 0` mutates `module.weight.data` on every step, which invalidates dynamo guards and triggers recompiles.
@@ -595,13 +595,14 @@ gradient_release = false
 train_micro_batch_size_per_gpu = 1
 ```
 Memory: weights 4.71 GB (bf16) + grads 4.71 GB + 8-bit Adam m/v 4.71 GB + Kahan shift 4.71 GB ≈ **18.3 GB**. Leaves ~13 GB headroom for t5/llm_adapter forward, grad-clip temporaries, and CUDA workspace.
-
-**Config B — `genericoptim` (~23 GB, bf16 optimizer states):**
+**Config B — `genericoptim` (~33 GB with fp32 shift, use `kahan_buffer_offload=true` for 32 GB):**
 ```
 [optimizer]
 type = 'genericoptim'
-# kahan_buffer_offload defaults to false (GPU-resident) — do NOT set it to true
-# or the 4.71 GB Kahan shift does a PCIe round-trip every step → slowdown.
+# fp32 Kahan shift is 9.42 GB GPU-resident by default (kahan_buffer_offload=false).
+# For 32 GB cards, enable CPU offload to free ~9 GB GPU memory at <5% speed cost:
+kahan_buffer_offload = true
+# Alternatively, if you have >40 GB VRAM, leave kahan_buffer_offload=false.
 
 [model]
 type = 'anima'
@@ -611,7 +612,7 @@ blocks_to_swap = 0
 gradient_release = false
 train_micro_batch_size_per_gpu = 1
 ```
-Memory: weights 4.71 + grads 4.71 + exp_avg 4.71 + exp_avg_sq 4.71 + shift 4.71 ≈ **22.8 GB** (all bf16 states). Leaves ~9 GB headroom.
+Memory: weights 4.71 + grads 4.71 + exp_avg 4.71 + exp_avg_sq 4.71 + fp32 shift 9.42 ≈ **28.3 GB** (GPU-resident with kahan_buffer_offload=false). With `kahan_buffer_offload=true`, shift moves to CPU → **18.8 GB** GPU. Leaves ~13 GB headroom on 32 GB cards.
 
 **Activation checkpointing is required.** Without it, 28 blocks × 5 tensors × 16.8 MB ≈ 7 GB of activations push the `genericoptim` path to ~30 GB — too close to the 32 GB ceiling. Two options:
   - `activation_checkpointing = 'unsloth'` (recommended): offloads each block's input to pinned RAM, overlapping the H2D copy with compute. This is one-shot checkpoint I/O, not sustained optimizer-state offload — it does not cause the persistent slowdown the 32 GB constraint targets.

@@ -487,7 +487,7 @@ if __name__ == '__main__':
         'gradient_accumulation_steps': config.get('gradient_accumulation_steps', 1),
         # Can't do gradient clipping with gradient release, since there are no grads at the end of the step anymore.
         'gradient_clipping': 0. if gradient_release else config.get('gradient_clipping', 1.0),
-        'steps_per_print': config.get('steps_per_print', 1),
+        'steps_per_print': config.get('steps_per_print', 2_000_000_000),  # Suppress DeepSpeed per-step noise (our tqdm handles UX)
     }
     caching_batch_size = config.get('caching_batch_size', 1)
     dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, keep_models_loaded=args.test_sample)
@@ -1106,6 +1106,11 @@ if __name__ == '__main__':
             elif epoch_save:
                 steps_to_epoch = steps_per_epoch - (step % steps_per_epoch)
                 postfix['save'] = f'{steps_to_epoch}s→ep'
+            if hasattr(optimizer, '_grad_norm') and optimizer._grad_norm > 0:
+                postfix['gn'] = f'{optimizer._grad_norm:.2f}'
+            lr = optimizer.param_groups[0].get('lr', 0)
+            if lr > 0:
+                postfix['lr'] = f'{lr:.2e}'
             pbar.set_postfix(postfix)
 
         new_epoch, checkpointed, saved = saver.process_epoch(epoch, step, examples)

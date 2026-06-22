@@ -18,10 +18,6 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import safetensors
-import transformers
-from transformers import T5TokenizerFast, T5EncoderModel, AutoTokenizer, AutoModelForCausalLM
-from accelerate import init_empty_weights
-from accelerate.utils import set_module_tensor_to_device
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from models.cosmos_predict2_modeling import MiniTrainDIT
@@ -590,6 +586,10 @@ class CosmosPredict2Pipeline(BasePipeline):
     ]
 
     def __init__(self, config):
+        import transformers
+        from transformers import T5TokenizerFast, T5EncoderModel, AutoTokenizer, AutoModelForCausalLM
+        from accelerate import init_empty_weights
+        from accelerate.utils import set_module_tensor_to_device
         self.config = config
         self.model_config = self.config['model']
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
@@ -697,7 +697,7 @@ class CosmosPredict2Pipeline(BasePipeline):
         state_dict = _remap_state_dict_keys(state_dict)
 
         dit_config = get_dit_config(state_dict)
-        dit_config['attention_backend'] = self.model_config.get('attention_backend')
+        dit_config['attention_backend'] = self.model_config.get('attention_backend', 'torch')
 
         if 'llm_adapter_path' in self.model_config:
             self.use_llm_adapter = True

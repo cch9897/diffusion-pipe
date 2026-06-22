@@ -287,7 +287,7 @@ class RMSNorm(torch.nn.Module):
 class GPT2FeedForward(nn.Module):
     def __init__(self, d_model: int, d_ff: int) -> None:
         super().__init__()
-        self.activation = nn.GELU(approximate='tanh')
+        self.activation = nn.GELU()
         self.layer1 = nn.Linear(d_model, d_ff, bias=False)
         self.layer2 = nn.Linear(d_ff, d_model, bias=False)
 
@@ -1249,12 +1249,15 @@ class MiniTrainDIT(nn.Module):
         extra_t_extrapolation_ratio: float = 1.0,
         rope_enable_fps_modulation: bool = True,
         use_llm_adapter=False,
-        attention_backend: str = None,
+        attention_backend: str = 'torch',
     ) -> None:
-        # Default to transformer_engine when available; fall back to torch.
-        # Users can force 'torch' via model_config['attention_backend'].
-        if attention_backend is None:
-            attention_backend = 'transformer_engine' if DotProductAttention is not None else 'torch'
+        if attention_backend not in ('torch', 'transformer_engine'):
+            raise ValueError(f"attention_backend must be 'torch' or 'transformer_engine', got {attention_backend}")
+        if attention_backend == 'transformer_engine' and DotProductAttention is None:
+            raise ImportError(
+                'transformer_engine is required for attention_backend=transformer_engine. '
+                'Install with: pip install transformer-engine'
+            )
         atten_backend = attention_backend
 
         super().__init__()

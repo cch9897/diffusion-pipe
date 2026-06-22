@@ -310,7 +310,7 @@ class GenericOptim(Optimizer):
             correct_dim=False,
             cpu_offload=False,
             kahan_buffer_offload=False,
-            kahan_shift_dtype='bf16',
+            kahan_shift_dtype='fp32',
             muon=False,
             adamuon=False,
             normuon=False,
